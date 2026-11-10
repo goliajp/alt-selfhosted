@@ -4,7 +4,7 @@ The server contains the native/Git data plane and the complete workbench. It use
 
 ## Build an offline bundle
 
-Use Docker Engine with Buildx and Compose, Python 3.11 or newer, and an Internet connection for the build. Build from an explicit source checkout. On a shared runner, follow its build-lock policy; the image compiles Rust and must not overlap a performance measurement.
+Use Docker Engine with Buildx and Compose, Python 3.11 or newer, and an Internet connection for the build. Build with Docker's classic image store; an engine that uses the containerd image store cannot build a bundle yet, although it can load and run one. Build from an explicit source checkout. On a shared runner, follow its build-lock policy; the image compiles Rust and must not overlap a performance measurement.
 
 ```sh
 python3 scripts/package-server.py --architecture amd64 --output /tmp/alt-server-amd64
@@ -73,4 +73,4 @@ The full command arguments, trust-key handling, generation selection and failure
 
 The Compose isolation and file-secret behavior follow the [Docker service specification](https://docs.docker.com/reference/compose-file/services/). The pinned database image's initial database and password settings follow the [official PostgreSQL image](https://hub.docker.com/_/postgres). Image sources and exact digests are recorded in `dependencies.json`; neither reference substitutes for this candidate's runtime acceptance.
 
-This repository is exported from [goliajp/alt](https://github.com/goliajp/alt) at `8e26cf811090bc330916de30bdf37876746afb5e`. The product overview is in [ALT.md](ALT.md). Please report problems in the issue tracker.
+This repository is exported from [goliajp/alt](https://github.com/goliajp/alt) at `57688dd73c2fb93ce6c0ab651f902764a2aa8933`. The product overview is in [ALT.md](ALT.md). Please report problems in the issue tracker.
