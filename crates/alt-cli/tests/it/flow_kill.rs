@@ -1,0 +1,344 @@
+//! SIGKILL recovery test for `alt flow` — the atomicity contract.
+//!
+//! Ref changes commit atomically. File/index materialization has a durable
+//! prepare/completion record and can be interrupted between writes. After a
+//! SIGKILL, reads must remain usable; explicit, precondition-checked recovery
+//! must finish pending intents before a fresh flow cycle can run.
+
+use std::path::Path;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+fn workload_command() -> Command {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command
+}
+
+fn kill_workload(child: &mut std::process::Child) {
+    // This exact process group was created above. Killing only the launcher
+    // can leave its current alt subprocess running and miss the crash window.
+    #[cfg(unix)]
+    assert_eq!(
+        unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) },
+        0
+    );
+    #[cfg(not(unix))]
+    child.kill().unwrap();
+}
+
+fn alt(repo: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_alt"))
+        .current_dir(repo)
+        .env("ALT_NO_DAEMON", "1")
+        .env("GIT_AUTHOR_NAME", "tester")
+        .env("GIT_AUTHOR_EMAIL", "t@e")
+        .env("USER", "tester")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn ok(o: Output) -> String {
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    String::from_utf8(o.stdout).unwrap()
+}
+
+/// Drain any staged-but-uncommitted state the killed child left behind.
+/// The race window is `alt add fN.txt` → SIGKILL → before `alt commit`:
+/// from alt's POV this is a coherent state (the index sits where it
+/// sat after the explicit `add`), but `flow feature start` correctly
+/// refuses to overwrite it. The recovery test isn't about that
+/// refusal — commit whatever's pending (a benign no-op when nothing
+/// is staged) so the subsequent fresh round can use the standard
+/// clean-tree path.
+fn settle_post_kill_dirty_state(root: &Path) {
+    // D02 records unfinished local writes explicitly. Complete only the
+    // recorded intent, with the product's full prestate checks, before moving on.
+    let pending: serde_json::Value =
+        serde_json::from_str(&ok(alt(root, &["operation", "pending", "--json"]))).unwrap();
+    for operation in pending["operations"].as_array().unwrap() {
+        let id = operation["operation_id"].as_str().unwrap();
+        ok(alt(root, &["operation", "recover", id]));
+    }
+    let status_json = alt(root, &["status", "--json"]);
+    if !status_json.status.success() {
+        return;
+    }
+    let body = String::from_utf8_lossy(&status_json.stdout);
+    // Heuristic — the schema carries `"staged":[...]` and
+    // `"unstaged":[...]`. A non-empty array means there's something to
+    // settle. We don't try to match JSON precisely; checking for the
+    // closing-bracket-after-bracket form `"staged":[]` / `"unstaged":[]`
+    // is enough to skip the no-op case fast.
+    if body.contains("\"staged\":[]") && body.contains("\"unstaged\":[]") {
+        return;
+    }
+    // Commit whatever the loop staged. The unstaged path needs an
+    // explicit add first so its files reach the index.
+    let _ = alt(root, &["add", "."]);
+    let _ = alt(
+        root,
+        &[
+            "commit",
+            "-m",
+            "settle-post-kill-dirty-state (test fixture)",
+        ],
+    );
+}
+
+/// Loop running `alt flow feature start fK` then `finish fK` for K = 0..,
+/// driven by env vars so the parent test below can spawn it via
+/// `current_exe()`. A no-op (instant return) when the env vars aren't
+/// set — keeps it harmless inside a plain `--ignored` sweep.
+#[test]
+#[ignore = "helper child workload, spawned by killed_flow_feature_recovers"]
+fn flow_child_workload() {
+    let Ok(repo) = std::env::var("ALT_FLOW_KILL_REPO") else {
+        return;
+    };
+    let repo = Path::new(&repo);
+    let mut k = 0u32;
+    loop {
+        let name = format!("f{k:04}");
+        let out = alt(repo, &["flow", "feature", "start", &name]);
+        if !out.status.success() {
+            // races against an already-extant branch can fail benignly
+            // (a previous incarnation of this loop finished it). Continue.
+            k = k.wrapping_add(1);
+            continue;
+        }
+        // make a small change so finish actually merges something
+        std::fs::write(repo.join(format!("{name}.txt")), "loop\n").ok();
+        let _ = alt(repo, &["add", &format!("{name}.txt")]);
+        let _ = alt(repo, &["commit", "-m", &name]);
+        let _ = alt(repo, &["flow", "feature", "finish", &name]);
+        k = k.wrapping_add(1);
+    }
+}
+
+/// Spawn the child, let it churn for a moment, SIGKILL it, then check
+/// every invariant the rest of the alt CLI relies on. The store must
+/// open cleanly, `alt status`, `alt log -n 1`, `alt branch` must all
+/// succeed, and a follow-on `flow feature start / finish` round must
+/// land successfully — proving the post-kill store isn't merely
+/// readable but still fully writeable.
+#[test]
+#[ignore = "spawns a child workload; lives next to the import kill test"]
+fn killed_flow_feature_recovers_and_converges() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // bring the store into a flow-ready shape: main has a commit; develop
+    // exists (flow init wires HEAD → develop).
+    ok(alt(root, &["init", "."]));
+    std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
+    ok(alt(root, &["add", "seed.txt"]));
+    ok(alt(root, &["commit", "-m", "seed"]));
+    ok(alt(root, &["flow", "init"]));
+
+    let mut child = workload_command()
+        .args(["--ignored", "--exact", "flow_kill::flow_child_workload"])
+        .env("ALT_FLOW_KILL_REPO", root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    // let the child run long enough to land at least a few iterations,
+    // then SIGKILL. The kill point is deliberately random with respect
+    // to where in start/finish the child is — that's the whole test.
+    std::thread::sleep(Duration::from_millis(250));
+    kill_workload(&mut child);
+    child.wait().unwrap();
+
+    // 1. Store opens. Any panic or "format" error here = atomicity broken.
+    let log = alt(root, &["log", "--pretty=oneline", "-n", "1"]);
+    assert!(
+        log.status.success(),
+        "alt log after kill: stderr={} stdout={}",
+        String::from_utf8_lossy(&log.stderr),
+        String::from_utf8_lossy(&log.stdout)
+    );
+
+    // 2. `alt status` reports a coherent view. The working tree may still
+    // hold loop-named files (the loop wrote them after start, before
+    // finish); we only need status to *succeed* — its exact output is
+    // post-kill state-dependent.
+    let st = alt(root, &["status"]);
+    assert!(
+        st.status.success(),
+        "alt status: stderr={}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+
+    // 3. Branch list works and contains develop. (Whether any half-
+    // finished feature branch remains depends on where the kill landed —
+    // either it's gone or it's fully wired. Both are acceptable.)
+    let br = ok(alt(root, &["branch"]));
+    assert!(
+        br.contains("develop"),
+        "branch list must hold develop: {br}"
+    );
+
+    // 4. Sanity: pick a fresh feature name and run a full start → commit
+    // → finish cycle. If atomicity was broken, this round usually trips
+    // on a stale ref or a corrupt op log.
+    //
+    // First clear any leftover dirty state from the killed child: if the
+    // kill landed between the loop's `alt add fN.txt` and the
+    // subsequent `alt commit -m fN`, the index is staged but the
+    // working tree isn't reset — a coherent state from alt's POV, but
+    // one that `flow feature start` correctly refuses to overwrite.
+    // The test isn't about that refusal; commit-or-reset whatever's
+    // pending so the fresh round runs on a clean slate.
+    settle_post_kill_dirty_state(root);
+    let fresh = "post-kill-feature";
+    ok(alt(root, &["flow", "feature", "start", fresh]));
+    std::fs::write(root.join("post.txt"), "post\n").unwrap();
+    ok(alt(root, &["add", "post.txt"]));
+    ok(alt(root, &["commit", "-m", "post"]));
+    ok(alt(root, &["flow", "feature", "finish", fresh]));
+
+    // and the new commit shows up on develop's log
+    let dev_log = ok(alt(root, &["log", "--pretty=oneline"]));
+    assert!(
+        dev_log.contains("post"),
+        "post-kill flow commit must land on develop: {dev_log}"
+    );
+}
+
+/// Same kill harness but for the release flow: spawn a child
+/// looping release start → commit → finish, SIGKILL, and verify the
+/// store stays atomic just like the feature variant. Release finish
+/// does *two* merges in one ref-tx (main, then back-merge into
+/// develop) — a real test that the release helper kept the atomic ref-transaction
+/// contract.
+#[test]
+#[ignore = "spawns a child workload; cousin of killed_flow_feature_recovers"]
+fn killed_flow_release_recovers_and_converges() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    ok(alt(root, &["init", "."]));
+    std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
+    ok(alt(root, &["add", "seed.txt"]));
+    ok(alt(root, &["commit", "-m", "seed"]));
+    ok(alt(root, &["flow", "init"]));
+
+    let mut child = workload_command()
+        .args(["--ignored", "--exact", "flow_kill::release_child_workload"])
+        .env("ALT_FLOW_KILL_REPO", root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    kill_workload(&mut child);
+    child.wait().unwrap();
+
+    for args in [
+        &["log", "--pretty=oneline", "-n", "1"][..],
+        &["status"][..],
+        &["branch"][..],
+    ] {
+        let out = alt(root, args);
+        assert!(
+            out.status.success(),
+            "post-kill alt {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    // Clean any post-kill staged/unstaged state so the fresh round
+    // runs on a clean slate — same rationale as the feature variant
+    // above.
+    settle_post_kill_dirty_state(root);
+    // a fresh release cycle completes against the post-kill store
+    ok(alt(root, &["flow", "release", "start", "post-kill"]));
+    std::fs::write(root.join("after.txt"), "after\n").unwrap();
+    ok(alt(root, &["add", "after.txt"]));
+    ok(alt(root, &["commit", "-m", "after"]));
+    ok(alt(root, &["flow", "release", "finish", "post-kill"]));
+    let log = ok(alt(root, &["log", "--pretty=oneline"]));
+    assert!(
+        log.contains("after"),
+        "post-kill release flow must complete: {log}"
+    );
+}
+
+#[test]
+#[ignore = "helper child workload, spawned by killed_flow_release_recovers"]
+fn release_child_workload() {
+    let Ok(repo) = std::env::var("ALT_FLOW_KILL_REPO") else {
+        return;
+    };
+    let repo = Path::new(&repo);
+    let mut k = 0u32;
+    loop {
+        let name = format!("r{k:04}");
+        let out = alt(repo, &["flow", "release", "start", &name]);
+        if !out.status.success() {
+            k = k.wrapping_add(1);
+            continue;
+        }
+        std::fs::write(repo.join(format!("{name}.txt")), "release\n").ok();
+        let _ = alt(repo, &["add", &format!("{name}.txt")]);
+        let _ = alt(repo, &["commit", "-m", &name]);
+        let _ = alt(repo, &["flow", "release", "finish", &name]);
+        k = k.wrapping_add(1);
+    }
+}
+
+/// Tighter race: hammer many short kills, asserting the store stays
+/// recoverable every time. Smoke-only — bounded to 5 iterations so the
+/// test still runs in a few seconds on a slow CI.
+#[test]
+#[ignore = "spawns child workloads; bounded iteration of the kill test"]
+fn repeated_kills_keep_the_store_consistent() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    ok(alt(root, &["init", "."]));
+    std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
+    ok(alt(root, &["add", "seed.txt"]));
+    ok(alt(root, &["commit", "-m", "seed"]));
+    ok(alt(root, &["flow", "init"]));
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    for round in 0..5 {
+        assert!(
+            Instant::now() < deadline,
+            "repeated kill test exceeded budget after round {round}"
+        );
+        let mut child = workload_command()
+            .args(["--ignored", "--exact", "flow_kill::flow_child_workload"])
+            .env("ALT_FLOW_KILL_REPO", root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(120));
+        kill_workload(&mut child);
+        child.wait().unwrap();
+
+        // log + branch + status all succeed every round
+        for args in [
+            &["log", "--pretty=oneline", "-n", "1"][..],
+            &["status"][..],
+            &["branch"][..],
+        ] {
+            let out = alt(root, args);
+            assert!(
+                out.status.success(),
+                "round {round}: alt {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr),
+            );
+        }
+    }
+}

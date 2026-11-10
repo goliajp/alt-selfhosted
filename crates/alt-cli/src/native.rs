@@ -1,0 +1,5060 @@
+// CARVE-OUT: pre-existing oversized module; split pieces out as they are touched
+//! Native `.alt` repository commands: `init`, `add`, `commit`, `status`.
+//! These wire the alt-worktree write primitives and alt-refs op log into a
+//! dogfoodable commit loop. The control dir is `<root>/.alt`; the index is
+//! git index v2 at `.alt/index`; HEAD and branches are native refs.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use alt_git_codec::{HashAlgo, ObjectId, ObjectKind};
+use alt_git_index::{Index, IndexEntry};
+use alt_odb::NativeOdb;
+use alt_refs::{IdemKey, OpId, RefChange, RefPolicy, RefStore, RefTarget};
+
+use crate::policy::{Capabilities, Policy};
+use alt_worktree::{
+    ChangeKind, Sig, WorkEntry, build_commit_bytes, flatten_tree, index_entries, status,
+    write_commit, write_tree,
+};
+use bstr::{BString, ByteSlice};
+use http_auth::{build_transport, http_auth};
+
+mod add;
+mod bisect;
+mod checkout_recovery;
+mod cherry_pick;
+pub mod commit;
+mod http_auth;
+mod identity;
+mod lfs;
+pub use identity::{Identity, Principal, PrincipalKind};
+mod merge;
+mod op_log;
+mod operation;
+use op_log::render_op_log_json;
+pub mod notes;
+use merge::Resolved;
+mod rebase;
+mod recovery;
+mod requests;
+mod revert;
+mod sequence_editor;
+mod task;
+mod workspace;
+pub use workspace::resolve_workspace;
+
+type Res<T> = Result<T, Box<dyn std::error::Error>>;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The shared, per-repository state under `<root>/.alt`: the object database,
+/// the ref store, and the hash algorithm. These are the parts the local daemon
+/// holds open across requests (amortizing the per-command open ~21ms); the
+/// per-workspace coordinates live in [`NativeRepo`], attached per request.
+pub struct Store {
+    alt_dir: PathBuf,
+    odb: NativeOdb,
+    refs: RefStore,
+    algo: HashAlgo,
+    /// The repository's capability policy, loaded from `<alt-dir>/policy`. A missing
+    /// file → [`Policy::empty`] (every principal gets [`Capabilities::full`]),
+    /// the zero-regression default. Daemon re-reads in [`refresh`](Self::refresh)
+    /// so an operator edit is picked up on the next request.
+    policy: Policy,
+}
+
+impl Store {
+    /// Opens (does not create) the store whose control dir is `alt_dir`.
+    pub fn open(alt_dir: PathBuf) -> Res<Self> {
+        Ok(Self {
+            odb: NativeOdb::open(&alt_dir)?,
+            refs: RefStore::open(&alt_dir)?,
+            policy: Policy::load(&alt_dir)?,
+            algo: alt_repo::native_object_format(&alt_dir)?,
+            alt_dir,
+        })
+    }
+
+    /// The control directory (`…/.alt`).
+    pub fn alt_dir(&self) -> &Path {
+        &self.alt_dir
+    }
+
+    /// Mutable access to the odb. `altd-server` puts incoming
+    /// pack objects through here directly, since it doesn't own a
+    /// NativeRepo (no working tree / index in the wire path).
+    pub fn odb_mut(&mut self) -> &mut NativeOdb {
+        &mut self.odb
+    }
+
+    /// Read-only handle for cheap state checks (e.g. the post-ingest
+    /// cursor snapshot in altd-server, which only needs to compare two
+    /// `OdbCheckpoint`s and never writes).
+    pub fn odb(&self) -> &NativeOdb {
+        &self.odb
+    }
+
+    /// Read-only odb fetch. The wire's commit-signature pass
+    /// re-reads each newly-ingested commit through this so verification
+    /// shares the same `NativeOdb` everyone else writes against (no
+    /// risk of a separate handle pinning a stale view).
+    pub fn odb_get(
+        &self,
+        oid: &ObjectId,
+    ) -> Result<Option<alt_git_codec::RawObject>, alt_odb::OdbError> {
+        self.odb.get(oid)
+    }
+
+    /// Mutable access to the refs store, for the same reason as
+    /// [`odb_mut`] — receive-pack commits the pushed ref-update list as
+    /// a single transaction through this handle.
+    pub fn refs_mut(&mut self) -> &mut RefStore {
+        &mut self.refs
+    }
+
+    /// Read-path catch-up: bring the odb and ref state up to date with writes
+    /// committed by other processes since the last refresh. The daemon calls
+    /// this at the start of every request so a served read is never stale.
+    /// Also re-loads the capability policy so a `.alt/policy` edit takes effect on
+    /// the next request without restarting the daemon.
+    pub fn refresh(&mut self) -> Res<()> {
+        self.odb.refresh()?;
+        self.refs.refresh()?;
+        self.policy = Policy::load(&self.alt_dir)?;
+        Ok(())
+    }
+
+    /// The capability gate this principal sees for the current policy.
+    pub fn capabilities_for(&self, principal: &Principal) -> Capabilities {
+        self.policy.lookup(principal)
+    }
+
+    /// The principals this store trusts for push signature checks.
+    /// Reads `<alt-dir>/trust/<principal>.pub` files via the
+    /// same scanner the local sig-verify command uses, so wire and local
+    /// trust roots can't diverge.
+    pub fn trust_keys(&self) -> Res<Vec<(String, alt_sign::PublicKey)>> {
+        read_pubkey_dir(&self.alt_dir.join("trust"))
+    }
+
+    /// The op that applied a keyed write, if one is in the durable idempotency
+    /// index — i.e. a request carrying `key` already took effect. The daemon
+    /// checks this (after [`refresh`](Self::refresh)) before running a keyed
+    /// write, so a same-id retry is acked instead of applied twice. Built
+    /// by replay, so it survives a daemon restart.
+    pub fn applied_request(&self, key: &IdemKey) -> Option<OpId> {
+        self.refs.applied_request(key)
+    }
+
+    /// Turns deferred durability on or off across the odb and the ref log. The
+    /// daemon turns it on once at open: a write appends under the request lock
+    /// but skips its inline fsync; the daemon then fsyncs off the write path via
+    /// its group-commit coordinator ([`Store::sink`]), coalescing concurrent
+    /// commits onto ~1 fsync. The direct CLI leaves it off (it fsyncs inline).
+    pub fn set_defer_durability(&mut self, on: bool) {
+        self.odb.set_defer_durability(on);
+        self.refs.set_defer_durability(on);
+    }
+
+    /// A monotonic count of deferred writes across the odb and ref log. The
+    /// daemon snapshots this around a request to tell whether the command wrote
+    /// (and so must wait for the group-commit fsync) — so reads (and write-free
+    /// commands) never pay a durability round trip.
+    pub fn write_epoch(&self) -> u64 {
+        self.odb.write_count() + self.refs.write_count()
+    }
+
+    /// An independent fsync handle over the odb (chunks → blobmap → `map.alt`)
+    /// and the ref log, in that durability order. The daemon holds one and
+    /// fsyncs off the request mutex. A shared odb lock excludes new appends
+    /// across the data-to-log barrier; multiple completed writes can coalesce.
+    pub fn sink(&self) -> Res<StoreSink> {
+        Ok(StoreSink {
+            odb: self.odb.sink()?,
+            oplog: self.refs.sync_handle()?,
+            odb_lock: self.alt_dir.join("odb.lock"),
+        })
+    }
+}
+
+/// Off-write-path durability handle for a [`Store`] (see [`Store::sink`]): the
+/// odb (objects) then the oplog (ref ops), so a durable ref op always has its
+/// commit object durable. Fsyncs through independent fds, needing no `&mut
+/// Store`. New object appends wait until both data and log are synchronized.
+pub struct StoreSink {
+    odb: alt_odb::OdbSink,
+    oplog: std::fs::File,
+    odb_lock: PathBuf,
+}
+
+impl StoreSink {
+    /// One fsync of everything currently on disk, in durability order. Because
+    /// fsync flushes the whole inode, this makes durable every append present
+    /// when it runs. Callers must flush their odb batch first to release its
+    /// exclusive write lock, including when durability is deferred.
+    pub fn fsync_all(&self) -> Res<()> {
+        // Each barrier needs an independent open-file description: sharing a
+        // cloned fd would let one concurrent barrier unlock another's lock.
+        // Closing the fd releases it on both success and error.
+        let _barrier = std::fs::File::open(&self.odb_lock)?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            loop {
+                if unsafe { libc::flock(_barrier.as_raw_fd(), libc::LOCK_SH) } == 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error.into());
+                }
+            }
+        }
+        self.odb.fsync()?;
+        self.oplog.sync_all()?;
+        Ok(())
+    }
+}
+
+/// The per-workspace coordinates within a repo: the working-tree root, the
+/// workspace name, the ref naming its HEAD, and its index file. Resolved per
+/// request and cheap to carry by value.
+#[derive(Clone)]
+pub struct Coord {
+    root: PathBuf,
+    workspace: String,
+    head_ref: String,
+    index_path: PathBuf,
+}
+
+impl Coord {
+    /// The ref this workspace's HEAD lives in: `HEAD` for the default
+    /// workspace, `workspaces/<name>/HEAD` for a named one.
+    pub fn head_ref(&self) -> &str {
+        &self.head_ref
+    }
+
+    /// The workspace's working-tree root.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The default workspace's coordinates for the repo rooted at `repo_root`
+    /// (its HEAD stays the bare `HEAD` ref and its index `.alt/index`, so
+    /// existing repos are unchanged).
+    fn default_at(repo_root: &Path) -> Coord {
+        let alt_dir = repo_root.join(".alt");
+        Coord {
+            index_path: alt_dir.join("index"),
+            root: repo_root.to_path_buf(),
+            workspace: DEFAULT_WORKSPACE.to_owned(),
+            head_ref: "HEAD".to_owned(),
+        }
+    }
+
+    /// The coordinates of workspace `name` in the repo whose control dir is
+    /// `alt_dir`. The default workspace's working tree is the repo root; a
+    /// named one's comes from its registry `meta`.
+    fn for_name(alt_dir: &Path, name: &str) -> Res<Coord> {
+        let repo_root = alt_dir.parent().unwrap_or(alt_dir);
+        if name == DEFAULT_WORKSPACE {
+            return Ok(Coord::default_at(repo_root));
+        }
+        let ws_dir = alt_dir.join("workspaces").join(name);
+        let worktree = std::fs::read_to_string(ws_dir.join("meta"))
+            .map_err(|_| format!("no such workspace '{name}'"))?;
+        Ok(Coord {
+            root: PathBuf::from(worktree.trim()),
+            workspace: name.to_owned(),
+            head_ref: format!("workspaces/{name}/HEAD"),
+            index_path: ws_dir.join("index"),
+        })
+    }
+}
+
+/// Owns an opened store plus the resolved workspace + identity for one CLI
+/// invocation. The daemon does not use this — it holds a [`Store`] across
+/// requests and attaches a [`NativeRepo`] per request.
+pub struct OpenRepo {
+    store: Store,
+    coord: Coord,
+    id: Identity,
+}
+
+impl OpenRepo {
+    /// Discovers the repo from `start`, selecting the default (or named)
+    /// workspace, and opens its store with the given caller identity.
+    pub fn discover(start: &Path, workspace: Option<&str>, id: Identity) -> Res<Self> {
+        let (alt_dir, coord) = resolve_workspace(start, workspace)?;
+        Ok(Self {
+            store: Store::open(alt_dir)?,
+            coord,
+            id,
+        })
+    }
+
+    /// The bound repo for issuing one command (direct CLI: no idempotency key,
+    /// so its writes are plain commits).
+    pub fn repo(&mut self) -> NativeRepo<'_> {
+        NativeRepo::attach(&mut self.store, self.coord.clone(), self.id.clone(), None)
+    }
+}
+
+/// `alt init [dir]`: create an empty native repo with an unborn HEAD → main.
+/// `alt clone <url> [<dir>]`: init + remote add origin + fetch + switch
+/// to the server's HEAD branch. The destination directory defaults
+/// to the URL's last path segment with any `.git` suffix stripped — same
+/// convention as `git clone`.
+///
+/// The composition lives at the top level (not on [`NativeRepo`]) because
+/// clone starts before any repository exists: it creates the working
+/// directory, runs init, then opens the repo to drive fetch/switch
+/// in-process.
+/// `alt import <target>`: ingest the git repo discovered at `cwd` into
+/// `<target>/.alt`, then materialize HEAD's tree into `<target>` so
+/// the work tree matches `alt status` (clean instead of "everything
+/// deleted"), so callers don't have to follow `alt import` with
+/// `alt switch <branch>` to get a usable work tree.
+///
+/// When `<target>` is the same path the import was discovered in,
+/// alt would be checking out into the directory that already holds
+/// the source files — we leave that case alone (skip checkout) so we
+/// never clobber the user's existing working copy.
+pub fn task_intake(
+    source: &Path,
+    target: &Path,
+    git: &Path,
+    json_mode: bool,
+    out: &mut impl Write,
+) -> Res<()> {
+    task::delivery_intake(source, target, git, json_mode, out)
+}
+
+pub fn import(
+    repo: &alt_repo::Repository,
+    target: &Path,
+    cwd: &Path,
+    id: Identity,
+    out: &mut impl Write,
+) -> Res<()> {
+    let alt_dir = target.join(".alt");
+    let timestamp_ms = now_ms();
+    let actor = format!(
+        "cli/import@{}",
+        std::env::var("USER").as_deref().unwrap_or("unknown")
+    );
+    let report = alt_import::import_git(repo, &alt_dir, &actor, timestamp_ms)?;
+    writeln!(
+        out,
+        "imported {} objects ({} new), {} refs ({} changed), \
+         {} lineage deltas into {}",
+        report.objects_seen,
+        report.objects_new,
+        report.refs_seen,
+        report.refs_changed,
+        report.lineage_deltas,
+        alt_dir.display()
+    )?;
+    match report.op {
+        Some(op) => writeln!(out, "op {op}")?,
+        None => writeln!(out, "already up to date, no op recorded")?,
+    }
+
+    // Decide whether to materialize. We only do it when the work tree
+    // is empty (a fresh import-into-blank-dir). If `target` is the
+    // *same* dir we discovered the source git in — i.e. the user is
+    // converting `.git` → `.alt` in place — the work tree already
+    // matches HEAD, and any "switch" pass would be a no-op at best,
+    // a clobber at worst.
+    let target_canon = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_owned());
+    let same_dir = repo
+        .work_tree()
+        .map(|w| {
+            let wt = std::fs::canonicalize(w).unwrap_or_else(|_| w.to_owned());
+            wt == target_canon
+        })
+        .unwrap_or(false);
+    let fresh = !same_dir && work_tree_is_empty(target);
+
+    // Attach the freshly-written .alt, take the LFS contents the source
+    // has, and materialize HEAD into a fresh tree. Errors here are
+    // reported but don't fail the whole import — the .alt store is
+    // already on disk and useful.
+    let mut open = match OpenRepo::discover(target, None, id) {
+        Ok(o) => o,
+        Err(e) => {
+            writeln!(out, "warning: cannot open imported store: {e}")?;
+            return Ok(());
+        }
+    };
+    let mut native = open.repo();
+    let taken = native.lfs_take(repo.git_dir())?;
+    if taken > 0 {
+        writeln!(out, "took {taken} LFS object(s)")?;
+    }
+    if !fresh {
+        return Ok(());
+    }
+    if let Err(e) = native.materialise_head() {
+        writeln!(
+            out,
+            "warning: import succeeded but work-tree materialize failed: {e}"
+        )?;
+    } else {
+        let branch = native.head_branch().unwrap_or_else(|_| "HEAD".to_string());
+        let short = branch
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&branch)
+            .to_string();
+        writeln!(out, "materialized {short} into {}", target.display())?;
+    }
+    let _ = cwd; // suppress unused-var when same_dir short-circuits
+    Ok(())
+}
+
+/// True when `target` either doesn't exist yet or holds only the
+/// freshly-created `.alt` directory (the import we just performed).
+/// Used to decide whether to clobber a work tree — if the user
+/// pointed at a dir that already has tracked files in it, we leave
+/// it alone.
+fn work_tree_is_empty(target: &Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(target) else {
+        return true;
+    };
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == ".alt" {
+            continue;
+        }
+        if name.starts_with('.') {
+            // dot-files like .DS_Store don't count as "tracked work tree"
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+pub fn clone(
+    url: &str,
+    dir: Option<&Path>,
+    json: bool,
+    cwd: &Path,
+    id: Identity,
+    out: &mut impl Write,
+) -> Res<()> {
+    let target = match dir {
+        Some(d) => d.to_owned(),
+        None => {
+            let derived = derive_clone_dir(url)
+                .ok_or_else(|| format!("cannot derive clone dir from URL '{url}'"))?;
+            cwd.join(derived)
+        }
+    };
+    let alt_dir = target.join(".alt");
+    if alt_dir.exists() {
+        return Err(format!("{} already exists", alt_dir.display()).into());
+    }
+    if target.exists() {
+        let empty = std::fs::read_dir(&target)?.next().is_none();
+        if !empty {
+            return Err(format!("'{}' exists and is not empty", target.display()).into());
+        }
+    } else {
+        std::fs::create_dir_all(&target)?;
+    }
+
+    // init: same control-dir layout as `alt init`, so subsequent commands
+    // can discover this clone like any local repo
+    init(Some(target.clone()), out)?;
+
+    // everything from here on routes through NativeRepo against the
+    // freshly-created store
+    let mut open = OpenRepo::discover(&target, None, id)?;
+    let mut repo = open.repo();
+    repo.remote_add("origin", url, /*json=*/ false, out)?;
+    repo.fetch("origin", &[], /*json=*/ false, out)?;
+
+    // pick the local branch to materialise: prefer the remote's HEAD
+    // symref target (mirrored as `refs/remotes/origin/HEAD` during fetch),
+    // falling back to `main` / `master` / the first remote-tracking head
+    let pick = pick_clone_branch(&repo)?;
+    if let Some((branch, oid)) = pick {
+        let local_ref = format!("refs/heads/{branch}");
+        if repo.store_refs_get(&local_ref).is_none() {
+            repo.create_branch_at(&local_ref, oid)?;
+        }
+        // init pointed HEAD at refs/heads/main symbolically; if the
+        // remote's default isn't 'main' we need to retarget HEAD too
+        let head_target = format!("refs/heads/{branch}");
+        let current_head = repo.store_refs_get("HEAD");
+        if !matches!(&current_head, Some(RefTarget::Symbolic(s)) if s == &head_target) {
+            repo.point_head_at(&head_target)?;
+        }
+        repo.materialise_head()?;
+        if json {
+            use crate::json::Json;
+            crate::json::emit(
+                out,
+                vec![
+                    ("url", Json::str(url)),
+                    ("dir", Json::str(target.display().to_string())),
+                    ("branch", Json::str(&branch)),
+                    ("head", Json::str(oid.to_string())),
+                ],
+            )?;
+        } else {
+            writeln!(
+                out,
+                "Cloned '{url}' into {} (HEAD → refs/heads/{branch})",
+                target.display()
+            )?;
+        }
+    } else if json {
+        use crate::json::Json;
+        crate::json::emit(
+            out,
+            vec![
+                ("url", Json::str(url)),
+                ("dir, no branches", Json::str(target.display().to_string())),
+                ("branch", Json::Null),
+            ],
+        )?;
+    } else {
+        writeln!(
+            out,
+            "Cloned '{url}' into {} (remote has no branches — HEAD unset)",
+            target.display()
+        )?;
+    }
+    Ok(())
+}
+
+fn derive_clone_dir(url: &str) -> Option<String> {
+    let last = url.trim_end_matches('/').rsplit('/').next()?;
+    let stripped = last.strip_suffix(".git").unwrap_or(last);
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped.to_owned())
+    }
+}
+
+fn pick_clone_branch(repo: &NativeRepo) -> Res<Option<(String, ObjectId)>> {
+    // (1) `refs/remotes/origin/HEAD` symref written by our fetch path
+    if let Some(RefTarget::Symbolic(target)) = repo.store_refs_get("refs/remotes/origin/HEAD")
+        && let Some(branch) = target.strip_prefix("refs/remotes/origin/")
+        && let Some(RefTarget::Oid(oid)) = repo.store_refs_get(&target)
+    {
+        return Ok(Some((branch.to_owned(), oid)));
+    }
+    // (2) common defaults
+    for cand in ["main", "master"] {
+        let r = format!("refs/remotes/origin/{cand}");
+        if let Some(RefTarget::Oid(oid)) = repo.store_refs_get(&r) {
+            return Ok(Some((cand.to_owned(), oid)));
+        }
+    }
+    // (3) first remote-tracking branch in name order
+    for (name, target) in repo.store_refs_iter() {
+        if let Some(branch) = name.strip_prefix("refs/remotes/origin/")
+            && branch != "HEAD"
+            && let RefTarget::Oid(oid) = target
+        {
+            return Ok(Some((branch.to_owned(), oid)));
+        }
+    }
+    Ok(None)
+}
+
+pub fn init(dir: Option<PathBuf>, out: &mut impl Write) -> Res<()> {
+    let root = dir.unwrap_or_else(|| PathBuf::from("."));
+    let alt_dir = root.join(".alt");
+    if alt_dir.exists() {
+        return Err(format!("{} already exists", alt_dir.display()).into());
+    }
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir(&alt_dir)?;
+    std::fs::File::open(&root)?.sync_all()?;
+    let mut odb = NativeOdb::open(&alt_dir)?;
+    odb.flush()?;
+    let mut refs = RefStore::open(&alt_dir)?;
+    let context = serde_json::to_vec(&recovery::RefContext {
+        version: 2,
+        effects: recovery::RefEffects::Unknown,
+        workspace: recovery::workspace_identity_at(&alt_dir.join("index"), DEFAULT_WORKSPACE)?,
+        inverse_of: None,
+        checkout: None,
+        request_id: None,
+    })?;
+    refs.commit_scoped(
+        &Identity::from_env().actor("init"),
+        now_ms(),
+        &[RefChange {
+            name: "HEAD".to_owned(),
+            old: None,
+            new: Some(RefTarget::Symbolic("refs/heads/main".to_owned())),
+        }],
+        None,
+        None,
+        Some(&context),
+    )?;
+    save_index(&alt_dir.join("index"), &empty_index(), HashAlgo::Sha1)?;
+    writeln!(
+        out,
+        "Initialized empty alt repository in {}",
+        alt_dir.display()
+    )?;
+    Ok(())
+}
+
+/// The default workspace's name — its HEAD stays the bare `HEAD` ref and its
+/// index stays at `.alt/index`, so existing repos are unchanged.
+const DEFAULT_WORKSPACE: &str = "default";
+
+/// An opened native repo bound to one workspace, for the span of one command.
+/// It borrows the shared [`Store`] (so the daemon can reuse one across requests)
+/// and owns the per-request coordinates and caller identity. The odb, branch
+/// refs, and op log are shared across workspaces; the HEAD ref, index, and
+/// working tree are per-workspace, so N agents can work in parallel.
+pub struct NativeRepo<'a> {
+    store: &'a mut Store,
+    root: PathBuf,
+    /// This workspace's name (`default` for the repo-root workspace).
+    workspace: String,
+    /// The ref naming this workspace's HEAD: `HEAD` for the default workspace,
+    /// `workspaces/<name>/HEAD` for a named one (kept out of `refs/heads/`).
+    head_ref: String,
+    /// This workspace's index file.
+    index_path: PathBuf,
+    /// The caller acting through this view.
+    id: Identity,
+    /// The capability gate for this caller's [`Principal`], derived from
+    /// the store's policy at [`attach`](Self::attach). Force / path gates are
+    /// applied here in `NativeRepo`; ref-namespace / read-only gates are
+    /// applied inside [`RefStore::commit_idempotent`] via [`RefPolicy`].
+    caps: Capabilities,
+    /// Whole-command attribution. Receipts deduplicate execution; individual
+    /// ref transactions must all run and must never share a deduplication key.
+    request_id: Option<IdemKey>,
+    write_lock: Option<std::fs::File>,
+    inverse_of: Option<String>,
+    checkout_intent: Option<checkout_recovery::CheckoutIntent>,
+}
+
+impl<'a> NativeRepo<'a> {
+    /// Binds a borrowed store to a workspace + identity for one command, with an
+    /// optional request identity for attributing every operation in a write.
+    pub fn attach(
+        store: &'a mut Store,
+        coord: Coord,
+        id: Identity,
+        request_id: Option<IdemKey>,
+    ) -> Self {
+        let caps = store.capabilities_for(&id.principal);
+        Self {
+            store,
+            root: coord.root,
+            workspace: coord.workspace,
+            head_ref: coord.head_ref,
+            index_path: coord.index_path,
+            id,
+            caps,
+            request_id,
+            write_lock: None,
+            inverse_of: None,
+            checkout_intent: None,
+        }
+    }
+
+    /// Reject the operation when the caller's policy forbids any write. Called
+    /// at the top of every mutating command — covers `add` (which only writes
+    /// the index, not refs) as well as the ref-producing commands.
+    /// Local branch_allow check for a push. `branch_allow` is a
+    /// list of glob patterns; if non-empty, every remote ref a push would
+    /// touch must match at least one pattern. The check uses the *short*
+    /// branch name (the part after `refs/heads/`) so a pattern like
+    /// `feature/*` lines up with how policy patterns are written for local
+    /// commit gating.
+    fn ensure_push_branch_allowed(&self, changes: &[RefChange]) -> Res<()> {
+        let allow = &self.caps.branch_allow;
+        let deny = &self.caps.branch_deny;
+        if allow.is_empty() && deny.is_empty() {
+            return Ok(());
+        }
+        for c in changes {
+            let short = match c.name.strip_prefix("refs/heads/") {
+                Some(s) => s,
+                // non-branch updates (tag pushes, etc.) fall outside the
+                // branch_allow gate — those would land in a separate
+                // ref_allow when we grow one
+                None => continue,
+            };
+            if deny.iter().any(|g| g.matches(short)) {
+                return Err(crate::machine::Failure::refusal(
+                    "capability_denied",
+                    format!(
+                        "capability denied: push to '{}' is blocked by branch_deny",
+                        c.name
+                    ),
+                )
+                .into());
+            }
+            if !allow.is_empty() && !allow.iter().any(|g| g.matches(short)) {
+                return Err(crate::machine::Failure::refusal(
+                    "capability_denied",
+                    format!(
+                        "capability denied: push to '{}' is not in branch_allow",
+                        c.name
+                    ),
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Git-default "non-fast-forward needs `-f`" gate, independent
+    /// of the capability policy. Force (`-f`) skips this; the policy's `forbid_force` is the deeper
+    /// gate that even `-f` cannot bypass (handled separately by
+    /// [`ensure_no_force`]).
+    fn ensure_fast_forward(&self, changes: &[RefChange]) -> Res<()> {
+        for c in changes {
+            let nff = match (&c.old, &c.new) {
+                // delete a ref that exists on the remote
+                (Some(_), None) => true,
+                // create / symref — nothing on the remote to overwrite
+                (None, _) => false,
+                (Some(RefTarget::Symbolic(_)), _) | (_, Some(RefTarget::Symbolic(_))) => false,
+                (Some(RefTarget::Oid(old)), Some(RefTarget::Oid(new))) => {
+                    // The remote-side `old` must be present locally for an
+                    // ancestor check; if it isn't, the user needs to fetch
+                    // first — surface that as a clear precondition error.
+                    match self.try_is_ancestor(*old, *new)? {
+                        Some(is_anc) => !is_anc,
+                        None => {
+                            return Err(format!(
+                                "remote ref '{}' is at {old} which is not in the local odb; \
+                                 run `alt fetch <remote>` and re-try",
+                                c.name
+                            )
+                            .into());
+                        }
+                    }
+                }
+            };
+            if nff {
+                return Err(
+                    format!("non-fast-forward push to '{}'; pass -f to override", c.name).into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Like [`is_ancestor`] but `Ok(None)` when one of the commits is
+    /// missing from the local odb instead of erroring — lets the caller
+    /// surface a precise "fetch first" message for the push pre-check.
+    fn try_is_ancestor(&self, old: ObjectId, new: ObjectId) -> Res<Option<bool>> {
+        if old == new {
+            return Ok(Some(true));
+        }
+        let repo = alt_repo::Repository::discover(&self.store.alt_dir)?;
+        if repo.read_object(&old)?.is_none() || repo.read_object(&new)?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(self.is_ancestor(old, new)?))
+    }
+
+    fn ensure_writable(&mut self, verb: &str) -> Res<()> {
+        if self.caps.read_only {
+            return Err(crate::machine::Failure::refusal(
+                "capability_denied",
+                format!("capability denied: principal cannot {verb} (read-only)"),
+            )
+            .into());
+        }
+        self.lock_workspace()?;
+        if self.caps.read_only {
+            return Err(crate::machine::Failure::refusal(
+                "capability_denied",
+                format!("capability denied: principal cannot {verb} (read-only)"),
+            )
+            .into());
+        }
+        self.ensure_no_pending_recovery()
+    }
+
+    /// Refuse `verb` on a protected branch (`main` / `develop` from the
+    /// flow model). Topic branches (`feature/<x>`, `release/<x>`,
+    /// `hotfix/<x>`) pass through; so does an unborn HEAD (the very
+    /// first commit before any flow exists, or a brand-new init that
+    /// hasn't run `alt flow init` yet).
+    ///
+    /// This is the central piece of alt's "one collaboration model"
+    /// stance — AI agents and humans both should never have to choose
+    /// between competing workflows. `git-flow` is *the* model: code
+    /// goes through topic branches, never directly into `main` or
+    /// `develop`. The escape hatch is `ALT_PROTECTED_OVERRIDE=1` for
+    /// the few legitimate emergencies (recovery, in-tree tooling
+    /// work, etc.); the env var is deliberately not a CLI flag so it
+    /// doesn't end up in a help-page menu that AIs might be tempted
+    /// to wander into.
+    /// The git-flow model for this repository: its production branch is
+    /// whichever of `master` / `main` exists (see `BranchModel::for_repo`).
+    fn flow_model(&self) -> alt_flow::BranchModel {
+        alt_flow::BranchModel::for_repo(|b| {
+            self.store_refs_get(&format!("refs/heads/{b}")).is_some()
+        })
+    }
+
+    fn ensure_topic_branch_or_unborn(&self, verb: &str) -> Res<()> {
+        if self.id.protected_override {
+            return Ok(());
+        }
+        let model = self.flow_model();
+        let head_ref = self.head_branch()?;
+        let short = match head_ref.strip_prefix("refs/heads/") {
+            Some(s) => s,
+            None => return Ok(()), // detached / non-branch HEAD: let the lower layers complain
+        };
+        let protected = short == model.main || short == model.develop;
+        if !protected {
+            return Ok(());
+        }
+        // Only enforce once flow has been initialised — gauged by the
+        // presence of `refs/heads/develop`. A fresh `alt init` repo
+        // with just `main` is pre-flow territory; the user might be
+        // doing the initial setup commits before deciding on a
+        // workflow. Once `alt flow init` lands, both branches become
+        // protected and the topic-branch contract kicks in.
+        let develop_ref = format!("refs/heads/{}", model.develop);
+        if self.store.refs.resolve(&develop_ref)?.is_none() {
+            return Ok(());
+        }
+        // The branch we're on must also exist as a ref — an unborn
+        // protected branch (rare; would mean flow init ran but
+        // pointed HEAD elsewhere) stays accessible for the first
+        // commit.
+        if self.store.refs.resolve(&head_ref)?.is_none() {
+            return Ok(());
+        }
+        let (prefix, flow_kind) = if short == model.main {
+            (&model.hotfix_prefix, "hotfix")
+        } else {
+            (&model.feature_prefix, "feature")
+        };
+        Err(crate::machine::Failure::refusal(
+            "precondition_failed",
+            format!(
+                "refusing to {verb} directly on protected branch '{short}'.\n\
+             alt's collaboration model is git-flow; topic branches are how work merges \
+             back. To carry your staged changes onto a topic branch right now:\n\
+             \n\
+             \x20 alt switch -c {prefix}<name>\n\
+             \n\
+             Or formally via flow (requires a clean index first):\n\
+             \x20 alt flow {flow_kind} start <name>\n\
+             \n\
+             (override with ALT_PROTECTED_OVERRIDE=1 only for emergency recovery — \
+             not for normal work.)"
+            ),
+        )
+        .into())
+    }
+
+    /// Reject staging/committing a path that the policy's `path_allow` does
+    /// not match. Empty allow-list = no constraint.
+    fn ensure_path_allowed(&self, path: &str) -> Res<()> {
+        if !self.caps.allows_path_name(path) {
+            return Err(crate::machine::Failure::refusal(
+                "capability_denied",
+                format!("capability denied: path '{path}' is not in path_allow"),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Reject a ref change that would be a non-fast-forward (or branch
+    /// deletion) when the policy sets `forbid_force`. A new ref pointing at a
+    /// commit that is *not* a descendant of the old one (or `new = None` for
+    /// deletion) is force. Creations (`old = None`) and symref moves are
+    /// allowed: nothing of value is being overwritten.
+    fn ensure_no_force(&self, changes: &[RefChange]) -> Res<()> {
+        if !self.caps.forbid_force {
+            return Ok(());
+        }
+        for c in changes {
+            let force = match (&c.old, &c.new) {
+                // deletion is the canonical force op
+                (Some(_), None) => true,
+                // creation cannot rewrite history
+                (None, _) => false,
+                // symref move: the source/destination are names, not commits;
+                // no commit graph is being overwritten
+                (Some(RefTarget::Symbolic(_)), _) | (_, Some(RefTarget::Symbolic(_))) => false,
+                (Some(RefTarget::Oid(old)), Some(RefTarget::Oid(new))) => {
+                    !self.is_ancestor(*old, *new)?
+                }
+            };
+            if force {
+                return Err(crate::machine::Failure::refusal(
+                    "capability_denied",
+                    format!(
+                        "capability denied: forbid_force is set and {} would not be a fast-forward",
+                        c.name
+                    ),
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// The single gate every CLI ref-changing op must go through: enforces
+    /// read-only and force/non-FF *before* entering the ref store, then asks
+    /// the store to do the atomic CAS-append with the namespace gate folded
+    /// in (via [`RefPolicy`]). A denial — at any axis — costs no on-disk
+    /// state. All subtransactions carry the request id in their context.
+    fn commit_refs(&mut self, verb: &str, changes: &[RefChange]) -> Res<OpId> {
+        self.commit_refs_with(verb, changes, None, recovery::RefEffects::Unknown)
+    }
+
+    /// Intermediate ref transaction, attributed to the same whole command.
+    fn commit_refs_unkeyed(&mut self, verb: &str, changes: &[RefChange]) -> Res<OpId> {
+        self.commit_refs_with(verb, changes, None, recovery::RefEffects::Unknown)
+    }
+
+    fn commit_refs_only(&mut self, verb: &str, changes: &[RefChange]) -> Res<OpId> {
+        self.commit_refs_with(verb, changes, None, recovery::RefEffects::RefsOnly)
+    }
+
+    fn commit_refs_checkout(
+        &mut self,
+        verb: &str,
+        changes: &[RefChange],
+        old: &[WorkEntry],
+        target: &[WorkEntry],
+    ) -> Res<OpId> {
+        self.lock_workspace()?;
+        self.ensure_no_pending_recovery()?;
+        self.preflight_checkout(old, target)?;
+        let intent = self.prepare_checkout(old, target)?;
+        self.checkout_intent = Some(intent.clone());
+        let result = self.commit_refs(verb, changes);
+        self.checkout_intent = None;
+        let operation = result?;
+        self.apply_prepared_checkout(operation, &intent)?;
+        Ok(operation)
+    }
+
+    fn commit_refs_with(
+        &mut self,
+        verb: &str,
+        changes: &[RefChange],
+        key: Option<IdemKey>,
+        effects: recovery::RefEffects,
+    ) -> Res<OpId> {
+        self.ensure_writable(verb)?;
+        self.lock_workspace()?;
+        self.ensure_no_force(changes)?;
+        let allow = self.caps.branch_allow.clone();
+        let deny = self.caps.branch_deny.clone();
+        let read_only = self.caps.read_only;
+        let has_constraint = !allow.is_empty() || !deny.is_empty();
+        let is_branch_allowed = move |name: &str| {
+            // deny wins over allow
+            if deny.iter().any(|g| g.matches(name)) {
+                return false;
+            }
+            allow.is_empty() || allow.iter().any(|g| g.matches(name))
+        };
+        let own_head = self.head_ref.clone();
+        let one_workspace_per_branch = move |refs: &_, changes: &[RefChange]| {
+            workspace::one_workspace_per_branch(&own_head, refs, changes)
+        };
+        let policy = RefPolicy {
+            read_only,
+            is_branch_allowed: if has_constraint {
+                Some(&is_branch_allowed)
+            } else {
+                None
+            },
+            state_check: Some(&one_workspace_per_branch),
+        };
+        let actor = self.id.actor(verb);
+        let context = serde_json::to_vec(&recovery::RefContext {
+            version: 2,
+            effects: if self.checkout_intent.is_some() {
+                recovery::RefEffects::Checkout
+            } else {
+                effects
+            },
+            workspace: self.workspace_identity()?,
+            inverse_of: self.inverse_of.clone(),
+            checkout: self.checkout_intent.clone(),
+            request_id: self.request_id.map(|id| crate::machine::hex(&id)),
+        })?;
+        let id = self.store.refs.commit_scoped(
+            &actor,
+            now_ms(),
+            changes,
+            key,
+            Some(&policy),
+            Some(&context),
+        )?;
+        // opt-in op-level signing. Best-effort — a missing sec key
+        // logs nothing and is not fatal (signing is a per-repo capability,
+        // not a hard requirement). Verification at read time tells the
+        // auditor which ops are signed and which aren't.
+        self.maybe_sign_op(id)?;
+        Ok(id)
+    }
+
+    /// Look up the active signing policy and, when enabled and the
+    /// caller has a sec key on disk, append a sidecar signature record
+    /// for `op_id` to `<alt-dir>/oplog/sigs.log`. Returns Ok even when
+    /// policy is off — signing is opt-in.
+    fn maybe_sign_op(&self, op_id: OpId) -> Res<()> {
+        let policy = SignPolicy::load(&self.store.alt_dir)?;
+        if !policy.enabled {
+            return Ok(());
+        }
+        let principal = policy
+            .principal
+            .unwrap_or_else(|| self.id.principal.id.clone());
+        let sec_path = self
+            .store
+            .alt_dir
+            .join("identity")
+            .join(format!("{principal}.sec"));
+        let sec_text = match std::fs::read_to_string(&sec_path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let sec = alt_sign::SecretKey::from_text(&sec_text)
+            .map_err(|e| format!("malformed sec key at {}: {e}", sec_path.display()))?;
+        let sig = sec.sign(&op_id.0);
+        let line = format!("{op_id} {principal} {}", sig.to_text());
+        // sigs.log is append-only, line-oriented; one open per write is
+        // simpler than holding a handle and matches op-log's own cadence
+        // (write transactions are infrequent compared to reads)
+        let sigs_path = self.store.alt_dir.join("oplog").join("sigs.log");
+        std::fs::create_dir_all(sigs_path.parent().unwrap())?;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&sigs_path)?;
+        f.write_all(line.as_bytes())?;
+        f.sync_all()?;
+        std::fs::File::open(sigs_path.parent().expect("oplog directory"))?.sync_all()?;
+        Ok(())
+    }
+
+    /// When signing is enabled, return `Some((principal, sig_text))`
+    /// for the canonical push payload over `updates`; the caller appends
+    /// the pair to the wire capability list. Returns `Ok(None)` when
+    /// signing is off or the sec key isn't present (a sign-policy file
+    /// pointing at an absent principal isn't fatal — push still goes
+    /// out, just unsigned, same fall-through as `maybe_sign_op`).
+    fn maybe_sign_push(
+        &self,
+        updates: &[alt_wire::RefUpdate],
+        server_nonce: Option<&str>,
+    ) -> Res<Option<(String, String)>> {
+        let policy = SignPolicy::load(&self.store.alt_dir)?;
+        if !policy.enabled {
+            return Ok(None);
+        }
+        let principal = policy
+            .principal
+            .unwrap_or_else(|| self.id.principal.id.clone());
+        let sec_path = self
+            .store
+            .alt_dir
+            .join("identity")
+            .join(format!("{principal}.sec"));
+        let sec_text = match std::fs::read_to_string(&sec_path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let sec = alt_sign::SecretKey::from_text(&sec_text)
+            .map_err(|e| format!("malformed sec key at {}: {e}", sec_path.display()))?;
+        // when the server advertised a single-use nonce in its
+        // info/refs caps, sign over `nonce <hex>\n` + canonical payload
+        // and echo the nonce back as a cap on the push. The server
+        // looks the nonce up and consumes it; a replay of the same
+        // captured push bytes hits a consumed/absent nonce and fails.
+        // Servers that didn't advertise a nonce (older ones) get the
+        // legacy payload — backward-compat.
+        let payload =
+            alt_wire::canonical_push_payload_with_nonce(updates, server_nonce, self.store.algo);
+        let sig = sec.sign(&payload);
+        // .to_text() includes a trailing newline; the wire cap list can
+        // not carry one, so strip it before declaring the cap
+        let sig_text = sig.to_text().trim().to_owned();
+        Ok(Some((principal, sig_text)))
+    }
+
+    /// When sign-policy is on and a sec key is on disk,
+    /// produce the *signed* form of `unsigned_bytes` (an `alt-sig`
+    /// header line spliced into the commit's header block). The caller
+    /// rehashes and puts to the odb. `Ok(None)` means "leave the commit
+    /// unsigned" — same fall-through as [`maybe_sign_push`].
+    fn maybe_sign_commit_bytes(&self, unsigned_bytes: &[u8]) -> Res<Option<Vec<u8>>> {
+        let policy = SignPolicy::load(&self.store.alt_dir)?;
+        if !policy.enabled {
+            return Ok(None);
+        }
+        let principal = policy
+            .principal
+            .unwrap_or_else(|| self.id.principal.id.clone());
+        let sec_path = self
+            .store
+            .alt_dir
+            .join("identity")
+            .join(format!("{principal}.sec"));
+        let sec_text = match std::fs::read_to_string(&sec_path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let sec = alt_sign::SecretKey::from_text(&sec_text)
+            .map_err(|e| format!("malformed sec key at {}: {e}", sec_path.display()))?;
+        let sig = sec.sign(unsigned_bytes);
+        let line = crate::commit_sign::alt_sig_line(&principal, &sig);
+        let signed = crate::commit_sign::embed_alt_sig(unsigned_bytes, &line)
+            .ok_or("commit bytes have no header/body separator")?;
+        Ok(Some(signed))
+    }
+
+    /// Walks `new`'s ancestor chain to see whether `old` appears (using the
+    /// repository's git object graph via the open `Repository`). Used by
+    /// [`ensure_no_force`] for the non-fast-forward check.
+    fn is_ancestor(&self, old: ObjectId, new: ObjectId) -> Res<bool> {
+        if old == new {
+            return Ok(true);
+        }
+        let repo = alt_repo::Repository::discover(&self.store.alt_dir)?;
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![new];
+        while let Some(c) = stack.pop() {
+            if !seen.insert(c) {
+                continue;
+            }
+            if c == old {
+                return Ok(true);
+            }
+            let obj = repo
+                .read_object(&c)?
+                .ok_or_else(|| format!("missing commit {c}"))?;
+            let commit = alt_git_codec::Commit::parse(&obj.data)?;
+            for p in commit.parents() {
+                stack.push(p);
+            }
+        }
+        Ok(false)
+    }
+
+    fn index(&self) -> Res<Index> {
+        match Index::open(&self.index_path, self.store.algo) {
+            Ok(i) => Ok(i),
+            Err(alt_git_index::IndexError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(empty_index())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn read_for(&self, w: &WorkEntry) -> Res<Vec<u8>> {
+        let abs = self
+            .root
+            .join(w.path.to_path().map_err(|_| "non-utf8 path")?);
+        if w.mode == 0o120000 {
+            Ok(std::fs::read_link(&abs)?
+                .as_os_str()
+                .as_encoded_bytes()
+                .to_vec())
+        } else {
+            Ok(std::fs::read(&abs)?)
+        }
+    }
+
+    fn make_entry(&self, w: &WorkEntry) -> Res<IndexEntry> {
+        // Gitlinks (submodules) have no on-disk file at the path — only an
+        // empty placeholder directory (or nothing, when the submodule has
+        // not been initialised). Git encodes their index entry with zero
+        // stat fields; do the same so the index round-trips cleanly.
+        if w.mode == 0o160000 {
+            return Ok(gitlink_entry(w));
+        }
+        let abs = self
+            .root
+            .join(w.path.to_path().map_err(|_| "non-utf8 path")?);
+        let meta = std::fs::symlink_metadata(&abs)?;
+        Ok(stat_entry(&meta, w))
+    }
+
+    /// `alt status`: staged / unstaged / untracked against HEAD and the index,
+    /// plus any unmerged (conflicted) paths left by a merge. With `json`, emits
+    /// the stable structured schema instead of the human view.
+    pub fn status(&self, json: bool, out: &mut impl Write) -> Res<()> {
+        let branch = self.head_branch()?;
+        let head = self.head_entries()?;
+        let raw = self.index()?;
+        let unmerged: std::collections::BTreeSet<BString> = raw
+            .entries
+            .iter()
+            .filter(|e| e.stage() > 0)
+            .map(|e| e.path.clone())
+            .collect();
+        let index = index_entries(&raw);
+        // Stat cache fast path: skip the read+hash on any file whose
+        // mtime/ctime/size/dev/ino/mode still matches the index entry —
+        // git's classic optimisation; on a 50k-file monorepo clean run
+        // this drops `alt status` from seconds to milliseconds.
+        let worktree = self.scan_tree(&raw)?;
+        let mut st = status(&head, &index, &worktree);
+        // unmerged paths are reported in their own section, not as
+        // staged/unstaged/untracked noise driven by the missing stage-0 entry
+        st.staged.retain(|(p, _)| !unmerged.contains(p));
+        st.unstaged.retain(|(p, _)| !unmerged.contains(p));
+        st.untracked.retain(|p| !unmerged.contains(p));
+
+        let short = branch.strip_prefix("refs/heads/").unwrap_or(&branch);
+        if json {
+            return render_status_json(out, short, &self.id.principal, &st, &unmerged);
+        }
+        writeln!(out, "On branch {short}")?;
+        let mark = |k: ChangeKind| match k {
+            ChangeKind::Added => "new file",
+            ChangeKind::Modified => "modified",
+            ChangeKind::Deleted => "deleted",
+        };
+        if !unmerged.is_empty() {
+            writeln!(out, "Unmerged paths:")?;
+            for p in &unmerged {
+                writeln!(out, "\tboth modified:   {p}")?;
+            }
+        }
+        if !st.staged.is_empty() {
+            writeln!(out, "Changes to be committed:")?;
+            for (p, k) in &st.staged {
+                writeln!(out, "\t{}:   {p}", mark(*k))?;
+            }
+        }
+        if !st.unstaged.is_empty() {
+            writeln!(out, "Changes not staged for commit:")?;
+            for (p, k) in &st.unstaged {
+                writeln!(out, "\t{}:   {p}", mark(*k))?;
+            }
+        }
+        if !st.untracked.is_empty() {
+            writeln!(out, "Untracked files:")?;
+            for p in &st.untracked {
+                writeln!(out, "\t{p}")?;
+            }
+        }
+        if unmerged.is_empty()
+            && st.staged.is_empty()
+            && st.unstaged.is_empty()
+            && st.untracked.is_empty()
+        {
+            writeln!(out, "nothing to commit, working tree clean")?;
+        }
+        Ok(())
+    }
+
+    /// The HEAD commit's tree flattened to entries (empty when unborn).
+    fn head_entries(&self) -> Res<Vec<WorkEntry>> {
+        match self.store.refs.resolve(&self.head_branch()?)? {
+            Some(commit) => self.commit_entries(commit),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// A commit's tree flattened to path-sorted entries.
+    fn commit_entries(&self, commit: ObjectId) -> Res<Vec<WorkEntry>> {
+        let obj = self
+            .store
+            .odb
+            .get(&commit)?
+            .ok_or("commit missing from store")?;
+        let tree = alt_git_codec::Commit::parse(&obj.data)?
+            .tree()
+            .ok_or("commit has no tree")?;
+        Ok(flatten_tree(&self.store.odb, tree, self.store.algo)?)
+    }
+
+    /// `alt diff` (index → working tree) or `alt diff --cached` (HEAD →
+    /// index): a git-style unified diff of the tracked changes. With `json`,
+    /// emits the structured per-file/per-hunk schema. With
+    /// `semantic`, item-level AST diff replaces the unified diff for
+    /// files in a language we have a parser for (`.rs` today); other files
+    /// fall back to the same line/binary output as without `--semantic`.
+    pub fn diff(&self, cached: bool, json: bool, semantic: bool, out: &mut impl Write) -> Res<()> {
+        // old side is always read from the object store; the new side is the
+        // index (cached) or the live working tree (default).
+        let (old, new, new_on_disk, show_added) = if cached {
+            (
+                self.head_entries()?,
+                index_entries(&self.index()?),
+                false,
+                true,
+            )
+        } else {
+            let raw = self.index()?;
+            // Sparse-from-index: no directory walk. One stat per
+            // indexed path, only read+hash on a stat mismatch. Untracked
+            // files are not in `alt diff`'s output (show_added=false), so
+            // skipping the dir traversal is correct — same shape git diff
+            // uses. Drops `alt diff` on a clean 50k-file monorepo from
+            // seconds to ≤100 ms.
+            let work = self.scan_index_paths(&raw)?;
+            let index = index_entries(&raw);
+            (index, work, true, false)
+        };
+
+        let changes: Vec<_> = alt_worktree::changes(&old, &new)
+            .into_iter()
+            // a working-tree file with no index entry is untracked, not a diff
+            .filter(|ch| ch.old.is_some() || show_added)
+            .collect();
+
+        if json {
+            return self.diff_json(&changes, new_on_disk, semantic, out);
+        }
+        let mut buf = Vec::new();
+        for ch in &changes {
+            self.emit_file_diff(&mut buf, ch, new_on_disk, semantic)?;
+        }
+        out.write_all(&buf)?;
+        Ok(())
+    }
+
+    /// Builds the `diff --json` document: `{schema_version, files:[…]}`, one
+    /// entry per changed file with its oids/modes, a `binary` flag, and the
+    /// structured hunks (empty for binary files). When `semantic` is set,
+    /// each file gains an `ast_diff` object for languages we have a parser
+    /// for; the field is `null` otherwise (including non-`--semantic` runs).
+    fn diff_json(
+        &self,
+        changes: &[alt_worktree::Change],
+        new_on_disk: bool,
+        semantic: bool,
+        out: &mut impl Write,
+    ) -> Res<()> {
+        use crate::json::Json;
+        let mut files = Vec::with_capacity(changes.len());
+        for ch in changes {
+            let old_bytes = match ch.old {
+                Some(w) => self.blob_bytes(w.oid)?,
+                None => Vec::new(),
+            };
+            let new_bytes = match ch.new {
+                Some(w) if new_on_disk => self.read_for(w)?,
+                Some(w) => self.blob_bytes(w.oid)?,
+                None => Vec::new(),
+            };
+            let status = match (ch.old, ch.new) {
+                (None, _) => "added",
+                (_, None) => "deleted",
+                _ => "modified",
+            };
+            let binary = alt_diff::is_binary(&old_bytes) || alt_diff::is_binary(&new_bytes);
+            let hunks = if binary {
+                Vec::new()
+            } else {
+                alt_diff::hunks(&old_bytes, &new_bytes, 3)
+                    .iter()
+                    .map(hunk_json)
+                    .collect()
+            };
+            // binary files get a structured chunk-diff summary so
+            // an agent can answer "how much of this binary is genuinely
+            // shared" via the same `--json` surface it uses for text — without
+            // the dump-the-bytes blow-up. Text files leave the field null;
+            // adding (not replacing) keeps the v1 schema backward-compatible.
+            let chunk_diff_field = if binary {
+                binary_chunk_diff_json(&old_bytes, &new_bytes)
+            } else {
+                Json::Null
+            };
+            // perceptual-style hint for recognised binary kinds
+            // (PNG today). Mirrors the human view's "perceptual diff: …"
+            // line; `null` for non-image / unknown / text. Additive — v1
+            // schema stays backward-compatible.
+            let perceptual_diff_field = if binary {
+                perceptual_diff_json(&old_bytes, &new_bytes)
+            } else {
+                Json::Null
+            };
+            // structured part-aware breakdown so an
+            // agent answers "which named chunk changed" without
+            // re-parsing the binary. `null` when neither side is a
+            // recognised kind (PNG today).
+            let part_diff_field = if binary {
+                part_aware_diff_json(&old_bytes, &new_bytes)
+            } else {
+                Json::Null
+            };
+            let ast_diff_field = if semantic && !binary {
+                ast_diff_json(ch.path.as_bytes(), &old_bytes, &new_bytes)
+            } else {
+                Json::Null
+            };
+            let oid = |w: Option<&WorkEntry>| match w {
+                Some(w) => Json::str(w.oid.to_string()),
+                None => Json::Null,
+            };
+            let mode = |w: Option<&WorkEntry>| match w {
+                Some(w) => Json::str(format!("{:06o}", w.mode)),
+                None => Json::Null,
+            };
+            files.push(Json::Object(vec![
+                ("path", Json::str(ch.path)),
+                ("status", Json::str(status)),
+                ("old_oid", oid(ch.old)),
+                ("new_oid", oid(ch.new)),
+                ("old_mode", mode(ch.old)),
+                ("new_mode", mode(ch.new)),
+                ("binary", Json::Bool(binary)),
+                ("hunks", Json::Array(hunks)),
+                ("chunk_diff", chunk_diff_field),
+                ("perceptual_diff", perceptual_diff_field),
+                ("part_diff", part_diff_field),
+                ("ast_diff", ast_diff_field),
+            ]));
+        }
+        let doc = Json::Object(vec![
+            ("schema_version", Json::Num(1)),
+            ("files", Json::Array(files)),
+        ]);
+        doc.write(out)?;
+        out.write_all(b"\n")?;
+        Ok(())
+    }
+
+    /// Writes one file's `diff --git` stanza (header + hunks, or a binary
+    /// notice) to `buf`. When `semantic` is set and the path has a parser,
+    /// the body is replaced by an AST-diff summary instead of the
+    /// unified hunks.
+    fn emit_file_diff(
+        &self,
+        buf: &mut Vec<u8>,
+        ch: &alt_worktree::Change,
+        new_on_disk: bool,
+        semantic: bool,
+    ) -> Res<()> {
+        let path = ch.path;
+        let old_bytes = match ch.old {
+            Some(w) => self.blob_bytes(w.oid)?,
+            None => Vec::new(),
+        };
+        let new_bytes = match ch.new {
+            Some(w) if new_on_disk => self.read_for(w)?,
+            Some(w) => self.blob_bytes(w.oid)?,
+            None => Vec::new(),
+        };
+
+        buf.extend_from_slice(format!("diff --git a/{path} b/{path}\n").as_bytes());
+        match (ch.old, ch.new) {
+            (None, Some(w)) => {
+                buf.extend_from_slice(format!("new file mode {:06o}\n", w.mode).as_bytes());
+            }
+            (Some(w), None) => {
+                buf.extend_from_slice(format!("deleted file mode {:06o}\n", w.mode).as_bytes());
+            }
+            (Some(o), Some(n)) if o.mode != n.mode => {
+                buf.extend_from_slice(format!("old mode {:06o}\n", o.mode).as_bytes());
+                buf.extend_from_slice(format!("new mode {:06o}\n", n.mode).as_bytes());
+            }
+            _ => {}
+        }
+        let o7 = abbrev(ch.old.map(|w| w.oid));
+        let n7 = abbrev(ch.new.map(|w| w.oid));
+        buf.extend_from_slice(format!("index {o7}..{n7}\n").as_bytes());
+
+        // when --semantic is set and we have a parser for this path,
+        // render the AST-level summary in place of the unified hunks. A
+        // parse error or unsupported language falls through to the regular
+        // diff body — the caller never loses signal, only sometimes the
+        // semantic resolution.
+        if semantic
+            && !alt_diff::is_binary(&old_bytes)
+            && !alt_diff::is_binary(&new_bytes)
+            && let Some(lang) = lang_for(path.as_bytes())
+            && let (Ok(old_s), Ok(new_s)) = (
+                std::str::from_utf8(&old_bytes),
+                std::str::from_utf8(&new_bytes),
+            )
+            && let Ok(ast) = alt_treediff::tree_diff(old_s, new_s, lang)
+        {
+            write_ast_diff_summary(buf, &ast);
+            return Ok(());
+        }
+
+        // structured-data semantic diff. `--semantic`
+        // gate as above; dispatch routes by file extension via
+        // `summary_for_path` (.json content-detect + .toml explicit).
+        // Parse failures fall through to the line diff — no signal loss.
+        if semantic
+            && !alt_diff::is_binary(&old_bytes)
+            && !alt_diff::is_binary(&new_bytes)
+            && let Ok(path_str) = std::str::from_utf8(path.as_bytes())
+            && let Some(structured) =
+                alt_diff::structured::summary_for_path(path_str, &old_bytes, &new_bytes)
+        {
+            buf.extend_from_slice(format!("{}\n", structured.render()).as_bytes());
+            return Ok(());
+        }
+
+        if alt_diff::is_binary(&old_bytes) || alt_diff::is_binary(&new_bytes) {
+            // git-compat line first (existing tests + muscle memory key off
+            // this exact wording); then a chunk-diff summary so the
+            // human view answers "how much is genuinely shared" too.
+            buf.extend_from_slice(
+                format!("Binary files a/{path} and b/{path} differ\n").as_bytes(),
+            );
+            let cd = alt_diff::binary::chunk_diff(
+                &old_bytes,
+                &new_bytes,
+                alt_diff::binary::DEFAULT_PARAMS,
+            );
+            let pct = (cd.byte_shared_ratio() * 100.0).round() as u32;
+            buf.extend_from_slice(
+                format!(
+                    "chunks: {} shared, {} added, {} removed ({pct}% bytes shared)\n",
+                    cd.shared_chunks, cd.added_chunks, cd.removed_chunks,
+                )
+                .as_bytes(),
+            );
+            // when both sides decompose under a known
+            // format (PNG today), surface the part-aware line so a
+            // reviewer reads "IDAT changed but IHDR didn't" rather
+            // than "47% bytes shared". Silent when either side isn't
+            // a recognised kind — the chunk-diff line above already
+            // covers the generic case.
+            if let Some(ps) = alt_diff::part_aware::summary(&old_bytes, &new_bytes) {
+                buf.extend_from_slice(format!("{}\n", ps.render()).as_bytes());
+            }
+            // when both sides are a kind we have a fingerprint for
+            // (PNG today), surface the perceptual-style hint so a reader
+            // sees "is this a small tweak or a wholly different image"
+            // without an external image tool. Stays silent when either
+            // side isn't a recognised kind — the chunk-diff line already
+            // covers the generic-binary case.
+            let old_fp = alt_diff::perceptual::fingerprint(&old_bytes);
+            let new_fp = alt_diff::perceptual::fingerprint(&new_bytes);
+            if let Some(d) = alt_diff::perceptual::distance(old_fp, new_fp) {
+                let kind = old_fp.unwrap().kind.as_str();
+                let pct_off = (d * 100.0).round() as u32;
+                buf.extend_from_slice(
+                    format!("perceptual diff: {pct_off}% off (prism={kind})\n").as_bytes(),
+                );
+            }
+            return Ok(());
+        }
+
+        match ch.old {
+            Some(_) => buf.extend_from_slice(format!("--- a/{path}\n").as_bytes()),
+            None => buf.extend_from_slice(b"--- /dev/null\n"),
+        }
+        match ch.new {
+            Some(_) => buf.extend_from_slice(format!("+++ b/{path}\n").as_bytes()),
+            None => buf.extend_from_slice(b"+++ /dev/null\n"),
+        }
+        alt_diff::write_unified(buf, &old_bytes, &new_bytes, 3);
+        Ok(())
+    }
+
+    fn blob_bytes(&self, oid: ObjectId) -> Res<Vec<u8>> {
+        Ok(self
+            .store
+            .odb
+            .get(&oid)?
+            .ok_or("object missing from store")?
+            .data)
+    }
+
+    /// Look up a ref by full name — pass-through to the shared refs store
+    /// (`store_refs_get` is the public, no-mut alias for callers like the
+    /// free-standing `clone` helper).
+    pub fn store_refs_get(&self, name: &str) -> Option<RefTarget> {
+        self.store.refs.get(name).cloned()
+    }
+
+    /// Iterate ref `(name, target)` pairs — owned, so the iterator doesn't
+    /// borrow the repo for its full lifetime (matters for clone's
+    /// drive-multiple-methods flow).
+    pub fn store_refs_iter(&self) -> Vec<(String, RefTarget)> {
+        self.store
+            .refs
+            .iter()
+            .map(|(n, t)| (n.to_owned(), t.clone()))
+            .collect()
+    }
+
+    /// Create a local branch at a given oid, one ref tx, no HEAD change —
+    /// used by clone to seed `refs/heads/<branch>` from a fetched
+    /// remote-tracking tip before switching to it.
+    pub fn create_branch_at(&mut self, full_name: &str, oid: ObjectId) -> Res<()> {
+        self.commit_refs_unkeyed(
+            "branch",
+            &[RefChange {
+                name: full_name.to_owned(),
+                old: None,
+                new: Some(RefTarget::Oid(oid)),
+            }],
+        )?;
+        Ok(())
+    }
+
+    /// Retarget HEAD to a symbolic ref (e.g. `refs/heads/develop`) — one
+    /// ref tx, no working-tree touch. Used by clone when the remote's
+    /// default branch isn't the init-default `main`.
+    pub fn point_head_at(&mut self, target: &str) -> Res<()> {
+        let head_ref = self.head_ref.clone();
+        let old = self.store.refs.get(&head_ref).cloned();
+        self.commit_refs_unkeyed(
+            "switch",
+            &[RefChange {
+                name: head_ref,
+                old,
+                new: Some(RefTarget::Symbolic(target.to_owned())),
+            }],
+        )?;
+        Ok(())
+    }
+
+    /// Materialise HEAD's tree into the working directory, replacing any
+    /// existing tracked files. Used by clone after wiring HEAD to a newly
+    /// created branch — `switch`'s "already on this branch" short-circuit
+    /// would otherwise skip the checkout. Errors if HEAD doesn't resolve
+    /// to a commit (a fresh init with no commits).
+    pub fn materialise_head(&mut self) -> Res<()> {
+        let target = self.head_entries()?;
+        if target.is_empty() {
+            return Ok(());
+        }
+        // start from an empty old work-tree state — clone's target dir is
+        // empty by construction, so there's nothing to remove
+        self.checkout(&[], &target)?;
+        Ok(())
+    }
+
+    fn head_branch(&self) -> Res<String> {
+        match self.store.refs.get(&self.head_ref) {
+            Some(RefTarget::Symbolic(b)) => Ok(b.clone()),
+            Some(RefTarget::Oid(_)) => Err("detached HEAD is not supported yet".into()),
+            None => Ok("refs/heads/main".to_owned()),
+        }
+    }
+
+    /// `alt branch`: list branches (no args), create one at HEAD (`name`),
+    /// or delete one (`delete`).
+    pub fn branch(
+        &mut self,
+        name: Option<String>,
+        delete: Option<String>,
+        remotes: bool,
+        json: bool,
+        out: &mut impl Write,
+    ) -> Res<()> {
+        match (name, delete) {
+            (_, Some(target)) if remotes => self.delete_ref(&format!("refs/remotes/{target}"), out),
+            (_, Some(target)) => self.delete_branch(&target, out),
+            (Some(new), None) => self.create_branch(&new, out),
+            (None, None) => self.list_branches(json, out),
+        }
+    }
+
+    fn list_branches(&self, json: bool, out: &mut impl Write) -> Res<()> {
+        let current = self.head_branch()?;
+        if json {
+            return self.list_branches_json(&current, out);
+        }
+        for (name, _) in self.store.refs.iter() {
+            if let Some(short) = name.strip_prefix("refs/heads/") {
+                let mark = if name == current { "* " } else { "  " };
+                writeln!(out, "{mark}{short}")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `branch --json`: `{schema_version, current, branches:[{name,current,oid}]}`
+    /// — every local branch with its tip oid and which one HEAD is on.
+    fn list_branches_json(&self, current: &str, out: &mut impl Write) -> Res<()> {
+        use crate::json::Json;
+        let mut branches = Vec::new();
+        for (name, _) in self.store.refs.iter() {
+            if let Some(short) = name.strip_prefix("refs/heads/") {
+                let oid = match self.store.refs.resolve(name)? {
+                    Some(o) => Json::str(o.to_string()),
+                    None => Json::Null,
+                };
+                branches.push(Json::Object(vec![
+                    ("name", Json::str(short)),
+                    ("current", Json::Bool(name == current)),
+                    ("oid", oid),
+                ]));
+            }
+        }
+        let short = current.strip_prefix("refs/heads/").unwrap_or(current);
+        let doc = Json::Object(vec![
+            ("schema_version", Json::Num(1)),
+            ("current", Json::str(short)),
+            ("branches", Json::Array(branches)),
+        ]);
+        doc.write(out)?;
+        out.write_all(b"\n")?;
+        Ok(())
+    }
+
+    fn create_branch(&mut self, name: &str, out: &mut impl Write) -> Res<()> {
+        check_branch_name(name)?;
+        let full = format!("refs/heads/{name}");
+        if self.store.refs.get(&full).is_some() {
+            return Err(crate::machine::Failure::refusal(
+                "precondition_failed",
+                format!("a branch named '{name}' already exists"),
+            )
+            .into());
+        }
+        let commit = self
+            .store
+            .refs
+            .resolve(&self.head_branch()?)?
+            .ok_or("cannot create a branch before the first commit")?;
+        self.commit_refs_only(
+            "branch",
+            &[RefChange {
+                name: full,
+                old: None,
+                new: Some(RefTarget::Oid(commit)),
+            }],
+        )?;
+        writeln!(out, "branch '{name}' created at {commit}")?;
+        Ok(())
+    }
+
+    fn delete_branch(&mut self, name: &str, out: &mut impl Write) -> Res<()> {
+        let full = format!("refs/heads/{name}");
+        if full == self.head_branch()? {
+            return Err(format!("cannot delete branch '{name}': it is the current branch").into());
+        }
+        self.delete_ref(&full, out)
+    }
+
+    /// Deletes `full` (a branch or remote-tracking ref) in one undoable op.
+    fn delete_ref(&mut self, full: &str, out: &mut impl Write) -> Res<()> {
+        let short = full
+            .strip_prefix("refs/heads/")
+            .or_else(|| full.strip_prefix("refs/remotes/"))
+            .unwrap_or(full);
+        let old = self
+            .store
+            .refs
+            .get(full)
+            .cloned()
+            .ok_or_else(|| format!("branch '{short}' not found"))?;
+        self.commit_refs_only(
+            "branch",
+            &[RefChange {
+                name: full.to_owned(),
+                old: Some(old),
+                new: None,
+            }],
+        )?;
+        writeln!(out, "deleted branch '{short}'")?;
+        Ok(())
+    }
+
+    /// `alt tag [-d <name>] [<name> [<rev>]] [-a] [-m <msg>] [--json]`.
+    /// A lightweight tag is a ref under `refs/tags/<name>` pointing
+    /// directly at the named commit (or HEAD when `rev` is omitted).
+    /// With `-a` or `-m`, an annotated tag writes a tag *object* whose
+    /// oid the ref points to instead.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tag(
+        &mut self,
+        name: Option<String>,
+        rev: Option<String>,
+        delete: Option<String>,
+        annotate: bool,
+        message: Option<String>,
+        json: bool,
+        out: &mut impl Write,
+    ) -> Res<()> {
+        match (name, delete) {
+            (_, Some(target)) => self.delete_tag(&target, out),
+            (Some(new), None) => {
+                if annotate {
+                    let msg = message.ok_or("annotated tag (-a) needs a message (-m \"…\")")?;
+                    self.create_annotated_tag(&new, rev.as_deref(), &msg, out)
+                } else if let Some(msg) = message {
+                    // git treats `-m` without `-a` as implicit `-a`.
+                    self.create_annotated_tag(&new, rev.as_deref(), &msg, out)
+                } else {
+                    self.create_tag(&new, rev.as_deref(), out)
+                }
+            }
+            (None, None) => self.list_tags(json, out),
+        }
+    }
+
+    fn list_tags(&self, json: bool, out: &mut impl Write) -> Res<()> {
+        let mut tags: Vec<(String, Option<String>)> = Vec::new();
+        for (name, _) in self.store.refs.iter() {
+            if let Some(short) = name.strip_prefix("refs/tags/") {
+                let oid = self.store.refs.resolve(name)?.map(|o| o.to_string());
+                tags.push((short.to_string(), oid));
+            }
+        }
+        tags.sort_by(|a, b| a.0.cmp(&b.0));
+        if json {
+            use crate::json::Json;
+            let arr: Vec<Json> = tags
+                .iter()
+                .map(|(name, oid)| {
+                    Json::Object(vec![
+                        ("name", Json::str(name)),
+                        (
+                            "oid",
+                            match oid {
+                                Some(o) => Json::str(o),
+                                None => Json::Null,
+                            },
+                        ),
+                    ])
+                })
+                .collect();
+            let doc = Json::Object(vec![
+                ("schema_version", Json::Num(1)),
+                ("tags", Json::Array(arr)),
+            ]);
+            doc.write(out)?;
+            out.write_all(b"\n")?;
+            return Ok(());
+        }
+        for (name, _) in &tags {
+            writeln!(out, "{name}")?;
+        }
+        Ok(())
+    }
+
+    fn create_tag(&mut self, name: &str, rev: Option<&str>, out: &mut impl Write) -> Res<()> {
+        check_tag_name(name)?;
+        let full = format!("refs/tags/{name}");
+        if self.store.refs.get(&full).is_some() {
+            return Err(format!("tag '{name}' already exists").into());
+        }
+        let target = match rev {
+            Some(spec) => {
+                let repo = alt_repo::Repository::discover(&self.store.alt_dir)?;
+                repo.rev_parse(spec)?
+                    .ok_or_else(|| format!("bad revision '{spec}'"))?
+            }
+            None => self
+                .store
+                .refs
+                .resolve(&self.head_branch()?)?
+                .ok_or("cannot tag before the first commit")?,
+        };
+        self.commit_refs_only(
+            "tag",
+            &[RefChange {
+                name: full,
+                old: None,
+                new: Some(RefTarget::Oid(target)),
+            }],
+        )?;
+        writeln!(out, "created tag '{name}' at {target}")?;
+        Ok(())
+    }
+
+    fn delete_tag(&mut self, name: &str, out: &mut impl Write) -> Res<()> {
+        let full = format!("refs/tags/{name}");
+        let old = self
+            .store
+            .refs
+            .get(&full)
+            .cloned()
+            .ok_or_else(|| format!("tag '{name}' not found"))?;
+        self.commit_refs_only(
+            "tag",
+            &[RefChange {
+                name: full,
+                old: Some(old),
+                new: None,
+            }],
+        )?;
+        writeln!(out, "deleted tag '{name}'")?;
+        Ok(())
+    }
+
+    /// `alt tag -a <name> -m <msg> [<rev>]`. Creates an annotated tag:
+    /// builds a git-canonical tag object (`object` + `type` + `tag` +
+    /// `tagger` + message), stores it under its sha1, and points
+    /// `refs/tags/<name>` at the tag object's oid (not the underlying
+    /// commit's). Unlike a lightweight tag, the ref target is a tag
+    /// object reachable via `cat-file -p`.
+    fn create_annotated_tag(
+        &mut self,
+        name: &str,
+        rev: Option<&str>,
+        message: &str,
+        out: &mut impl Write,
+    ) -> Res<()> {
+        check_tag_name(name)?;
+        let full = format!("refs/tags/{name}");
+        if self.store.refs.get(&full).is_some() {
+            return Err(format!("tag '{name}' already exists").into());
+        }
+        let target = match rev {
+            Some(spec) => {
+                let repo = alt_repo::Repository::discover(&self.store.alt_dir)?;
+                repo.rev_parse(spec)?
+                    .ok_or_else(|| format!("bad revision '{spec}'"))?
+            }
+            None => self
+                .store
+                .refs
+                .resolve(&self.head_branch()?)?
+                .ok_or("cannot tag before the first commit")?,
+        };
+        // The kind of the target — we accept commits today (the common
+        // case). Annotated tags of trees / blobs / other tags exist in
+        // git, but no first-pass dogfood scenario asks for them.
+        let target_kind = self
+            .store
+            .odb
+            .lookup(&target)
+            .map(|e| e.kind)
+            .ok_or_else(|| format!("target {target} not in the object store"))?;
+        let type_str = match target_kind {
+            ObjectKind::Commit => "commit",
+            ObjectKind::Tree => "tree",
+            ObjectKind::Blob => "blob",
+            ObjectKind::Tag => "tag",
+        };
+
+        let when = (now_ms() / 1000) as i64;
+        let (tagger_name, tagger_email) = self.id.sig();
+        let msg = if message.ends_with('\n') {
+            message.to_owned()
+        } else {
+            format!("{message}\n")
+        };
+        let bytes = build_tag_bytes(
+            target,
+            type_str,
+            name,
+            tagger_name,
+            tagger_email,
+            when,
+            "+0000",
+            &msg,
+        );
+        let tag_oid = ObjectId::hash_object(self.store.algo, ObjectKind::Tag, &bytes);
+        self.store.odb.put(tag_oid, ObjectKind::Tag, &bytes)?;
+        self.store.odb.flush()?;
+
+        self.commit_refs_only(
+            "tag",
+            &[RefChange {
+                name: full,
+                old: None,
+                new: Some(RefTarget::Oid(tag_oid)),
+            }],
+        )?;
+        writeln!(out, "created annotated tag '{name}' ({tag_oid}) → {target}")?;
+        Ok(())
+    }
+
+    /// `alt switch <name>`: point HEAD at branch `name` and materialize its
+    /// tree into the working tree. `-c` creates the branch first. Switching
+    /// to an existing branch requires a clean tree (no staged/unstaged
+    /// changes) so no uncommitted work is lost.
+    pub fn switch(
+        &mut self,
+        name: &str,
+        create: bool,
+        json: bool,
+        out: &mut impl Write,
+    ) -> Res<()> {
+        self.ensure_no_merge_in_progress("switch")?;
+        let full = format!("refs/heads/{name}");
+        let current = self.head_branch()?;
+
+        // emit either the human line or `{schema_version, branch, result}`
+        let report = |out: &mut dyn Write, result: &'static str, human: &str| -> Res<()> {
+            if json {
+                use crate::json::Json;
+                crate::json::emit(
+                    out,
+                    vec![("branch", Json::str(name)), ("result", Json::str(result))],
+                )?;
+            } else {
+                writeln!(out, "{human}")?;
+            }
+            Ok(())
+        };
+
+        if create {
+            check_branch_name(name)?;
+            if self.store.refs.get(&full).is_some() {
+                return Err(crate::machine::Failure::refusal(
+                    "precondition_failed",
+                    format!("a branch named '{name}' already exists"),
+                )
+                .into());
+            }
+            // a new branch starts at the current commit (if any); the working
+            // tree and index carry over unchanged, so no checkout is needed.
+            if let Some(commit) = self.store.refs.resolve(&current)? {
+                // non-terminal tx of switch-with-create: the move_head below
+                // is the one that carries this command's idempotency key.
+                self.commit_refs_unkeyed(
+                    "branch",
+                    &[RefChange {
+                        name: full.clone(),
+                        old: None,
+                        new: Some(RefTarget::Oid(commit)),
+                    }],
+                )?;
+            }
+            self.move_head(&current, &full)?;
+            return report(
+                out,
+                "created",
+                &format!("Switched to a new branch '{name}'"),
+            );
+        }
+
+        if self.store.refs.get(&full).is_none() {
+            return Err(crate::machine::Failure::refusal(
+                "precondition_failed",
+                format!("invalid reference: {name}"),
+            )
+            .into());
+        }
+        if full == current {
+            return report(out, "already_on", &format!("Already on '{name}'"));
+        }
+        self.ensure_clean("switch")?;
+
+        let target = match self.store.refs.resolve(&full)? {
+            Some(commit) => self.commit_entries(commit)?,
+            None => Vec::new(), // unborn target: tree becomes empty
+        };
+        let old = index_entries(&self.index()?);
+        let head_ref = self.head_ref.clone();
+        let head_old = self.store.refs.get(&head_ref).cloned();
+        self.commit_refs_checkout(
+            "switch",
+            &[RefChange {
+                name: head_ref,
+                old: head_old,
+                new: Some(RefTarget::Symbolic(full.clone())),
+            }],
+            &old,
+            &target,
+        )?;
+        report(out, "switched", &format!("Switched to branch '{name}'"))
+    }
+
+    /// Refuses `action` if any tracked file has staged or unstaged changes, so
+    /// a tree-rewriting operation never clobbers uncommitted work.
+    fn ensure_clean(&self, action: &str) -> Res<()> {
+        let head = self.head_entries()?;
+        let raw = self.index()?;
+        let index = index_entries(&raw);
+        let worktree = self.scan_tree(&raw)?;
+        let st = status(&head, &index, &worktree);
+        if !st.staged.is_empty() || !st.unstaged.is_empty() {
+            return Err(crate::machine::Failure::refusal(
+                "precondition_failed",
+                format!("your local changes would be overwritten by {action}; commit them first"),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Materializes `target` into the working tree, removing tracked files in
+    /// `old` that are absent from `target`, and rewrites the index to match.
+    fn checkout(&mut self, old: &[WorkEntry], target: &[WorkEntry]) -> Res<()> {
+        self.recoverable_checkout(old, target)
+    }
+
+    /// Writes one tree entry to the working tree (regular file, executable,
+    /// or symlink), creating parent dirs and replacing whatever was there.
+    /// Gitlink entries (mode 160000) point at a submodule commit that lives
+    /// in another repo — there is nothing to write at our odb's level. Match
+    /// git's plain `clone` (no `--recurse-submodules`) by ensuring the
+    /// placeholder directory exists and stopping there. Submodule
+    /// fetch/checkout is not implemented; this only avoids the materialise crash.
+    fn materialize(&self, w: &WorkEntry) -> Res<()> {
+        let abs = self.abs(&w.path)?;
+        if w.mode == 0o160000 {
+            if abs.symlink_metadata().is_ok_and(|m| !m.is_dir()) {
+                crate::durable::remove_file(&abs)?;
+            }
+            std::fs::create_dir_all(&abs)?;
+            return Ok(());
+        }
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if abs.symlink_metadata().is_ok() {
+            crate::durable::remove_file(&abs)?;
+        }
+        let obj = self
+            .store
+            .odb
+            .get(&w.oid)?
+            .ok_or("blob missing from store")?;
+        if w.mode == 0o120000 {
+            symlink_to(&obj.data, &abs)?;
+        } else {
+            let content = match alt_lfs::Pointer::parse(&obj.data) {
+                Some(p) => self.lfs_content(&p)?,
+                None => None,
+            };
+            crate::durable::write(&abs, content.as_deref().unwrap_or(&obj.data))?;
+            set_exec(&abs, w.mode == 0o100755)?;
+        }
+        Ok(())
+    }
+
+    /// Removes now-empty directories from `dir` up toward the root.
+    fn prune_empty_dirs(&self, dir: Option<&Path>) {
+        let mut cur = dir;
+        while let Some(d) = cur {
+            if d == self.root || std::fs::remove_dir(d).is_err() {
+                break; // reached the root or a non-empty directory
+            }
+            cur = d.parent();
+        }
+    }
+
+    fn abs(&self, rel: &BString) -> Res<PathBuf> {
+        Ok(self.root.join(rel.to_path().map_err(|_| "non-utf8 path")?))
+    }
+
+    /// Moves HEAD's symbolic target from `from` to `to` in one ref op.
+    fn move_head(&mut self, from: &str, to: &str) -> Res<()> {
+        let old = self.store.refs.get(&self.head_ref).cloned();
+        let head_ref = self.head_ref.clone();
+        self.commit_refs_only(
+            "switch",
+            &[RefChange {
+                name: head_ref,
+                old: old.or_else(|| Some(RefTarget::Symbolic(from.to_owned()))),
+                new: Some(RefTarget::Symbolic(to.to_owned())),
+            }],
+        )?;
+        Ok(())
+    }
+
+    /// `alt merge <branch>`: three-way merge `branch` into the current branch.
+    /// Returns whether the merge stopped in conflict. Fast-forwards when our
+    /// branch is strictly behind; otherwise writes a two-parent merge commit
+    /// (clean) or leaves conflict markers + unmerged index entries and makes
+    /// no commit (conflicting). A clean working tree is required.
+    pub fn merge(&mut self, branch_name: &str, json: bool, out: &mut impl Write) -> Res<bool> {
+        self.ensure_topic_branch_or_unborn("merge")?;
+        let their_ref = format!("refs/heads/{branch_name}");
+        let theirs = self
+            .store
+            .refs
+            .resolve(&their_ref)?
+            .ok_or_else(|| format!("merge: {branch_name} - not something we can merge"))?;
+        let cur = self.head_branch()?;
+        let ours = self
+            .store
+            .refs
+            .resolve(&cur)?
+            .ok_or("cannot merge into an unborn branch")?;
+        self.ensure_clean("merge")?;
+
+        match self.compute_merge(ours, theirs, branch_name)? {
+            MergeOutcome::UpToDate => {
+                self.report_merge(json, out, "up_to_date", None, &[], "Already up to date.")?;
+                Ok(false)
+            }
+            MergeOutcome::FastForward(commit) => {
+                let target = self.commit_entries(commit)?;
+                let old = index_entries(&self.index()?);
+                self.advance_branch_checkout(&cur, ours, commit, &old, &target)?;
+                self.report_merge(
+                    json,
+                    out,
+                    "fast_forward",
+                    Some(commit),
+                    &[],
+                    &format!("Fast-forward to {commit}"),
+                )?;
+                Ok(false)
+            }
+            MergeOutcome::Merged { commit, entries } => {
+                let old = index_entries(&self.index()?);
+                self.advance_branch_checkout(&cur, ours, commit, &old, &entries)?;
+                self.report_merge(
+                    json,
+                    out,
+                    "merged",
+                    Some(commit),
+                    &[],
+                    "Merge made by the 'ort' strategy.",
+                )?;
+                Ok(false)
+            }
+            MergeOutcome::Conflicted(resolved) => {
+                self.write_conflicted(&resolved)?;
+                self.start_merge(theirs)?;
+                let conflicts: Vec<BString> = resolved
+                    .iter()
+                    .filter(|r| r.conflicted)
+                    .map(|r| r.path.clone())
+                    .collect();
+                if json {
+                    self.report_merge(true, out, "conflicted", None, &conflicts, "")?;
+                } else {
+                    for p in &conflicts {
+                        writeln!(out, "CONFLICT (content): Merge conflict in {p}")?;
+                    }
+                    writeln!(
+                        out,
+                        "Automatic merge failed; fix conflicts and then commit the result."
+                    )?;
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    /// Emits one merge outcome: the human line, or `{schema_version, result,
+    /// commit?, conflicts}` for `--json`.
+    fn report_merge(
+        &self,
+        json: bool,
+        out: &mut impl Write,
+        result: &'static str,
+        commit: Option<ObjectId>,
+        conflicts: &[BString],
+        human: &str,
+    ) -> Res<()> {
+        if json {
+            use crate::json::Json;
+            crate::json::emit(
+                out,
+                vec![
+                    ("result", Json::str(result)),
+                    (
+                        "commit",
+                        match commit {
+                            Some(c) => Json::str(c.to_string()),
+                            None => Json::Null,
+                        },
+                    ),
+                    (
+                        "conflicts",
+                        Json::Array(conflicts.iter().map(Json::str).collect()),
+                    ),
+                ],
+            )?;
+        } else {
+            writeln!(out, "{human}")?;
+        }
+        Ok(())
+    }
+
+    /// Computes how merging `theirs` into `ours` resolves, writing any merged
+    /// blobs / tree / merge commit to the object store but touching no refs or
+    /// working tree. The caller applies the outcome (advancing refs, checking
+    /// out, or recording a conflict) — which lets both `alt merge` and the
+    /// atomic `flow finish` share one merge engine.
+    fn compute_merge(
+        &mut self,
+        ours: ObjectId,
+        theirs: ObjectId,
+        label: &str,
+    ) -> Res<MergeOutcome> {
+        let bases = self.merge_bases(&[ours], &[theirs])?;
+        if bases == [theirs] {
+            return Ok(MergeOutcome::UpToDate);
+        }
+        if bases == [ours] {
+            return Ok(MergeOutcome::FastForward(theirs));
+        }
+        let base_entries = self.base_entries(&bases)?;
+        let ours_entries = self.commit_entries(ours)?;
+        let theirs_entries = self.commit_entries(theirs)?;
+        let resolved = self.merge_trees(&base_entries, &ours_entries, &theirs_entries, label)?;
+        self.store.odb.flush()?;
+
+        if resolved.iter().any(|r| r.conflicted) {
+            return Ok(MergeOutcome::Conflicted(resolved));
+        }
+
+        let entries: Vec<WorkEntry> = resolved.iter().filter_map(|r| r.entry.clone()).collect();
+        let tree = write_tree(&mut self.store.odb, &entries, self.store.algo)?;
+        let when = (now_ms() / 1000) as i64;
+        let (name, email) = self.id.sig();
+        let sig = Sig {
+            name,
+            email,
+            when,
+            tz: "+0000",
+        };
+        let msg = format!("Merge branch '{label}'\n");
+        let commit = write_commit(
+            &mut self.store.odb,
+            tree,
+            &[ours, theirs],
+            &sig,
+            &sig,
+            &msg,
+            self.store.algo,
+        )?;
+        self.store.odb.flush()?;
+        Ok(MergeOutcome::Merged { commit, entries })
+    }
+
+    /// `alt flow init`: create `develop` off `main` (or the current branch's
+    /// commit) and switch to it, in one ref transaction.
+    pub fn flow_init(&mut self, json: bool, out: &mut impl Write) -> Res<()> {
+        use crate::json::Json;
+        let model = self.flow_model();
+        let dev_ref = format!("refs/heads/{}", model.develop);
+        if self.store.refs.get(&dev_ref).is_some() {
+            if json {
+                crate::json::emit(
+                    out,
+                    vec![
+                        ("develop", Json::str(model.develop)),
+                        ("already_initialized", Json::Bool(true)),
+                    ],
+                )?;
+            } else {
+                writeln!(out, "flow already initialized (branch '{}')", model.develop)?;
+            }
+            return Ok(());
+        }
+        let main_ref = format!("refs/heads/{}", model.main);
+        let start = match self.store.refs.resolve(&main_ref)? {
+            Some(c) => c,
+            None => self
+                .store
+                .refs
+                .resolve(&self.head_branch()?)?
+                .ok_or("create an initial commit before 'alt flow init'")?,
+        };
+        let head_old = self.store.refs.get(&self.head_ref).cloned();
+        let head_ref = self.head_ref.clone();
+        self.commit_refs_only(
+            "flow",
+            &[
+                RefChange {
+                    name: dev_ref.clone(),
+                    old: None,
+                    new: Some(RefTarget::Oid(start)),
+                },
+                RefChange {
+                    name: head_ref,
+                    old: head_old,
+                    new: Some(RefTarget::Symbolic(dev_ref.clone())),
+                },
+            ],
+        )?;
+        if json {
+            crate::json::emit(
+                out,
+                vec![
+                    ("develop", Json::str(model.develop)),
+                    ("already_initialized", Json::Bool(false)),
+                    ("commit", Json::str(start.to_string())),
+                ],
+            )?;
+        } else {
+            writeln!(
+                out,
+                "Initialized flow: created '{}' at {start}",
+                model.develop
+            )?;
+        }
+        Ok(())
+    }
+
+    /// `alt flow feature start <name>`: branch `feature/<name>` off `develop`
+    /// and switch to it, atomically (one op log entry → O(1) undo).
+    pub fn flow_feature_start(&mut self, name: &str, json: bool, out: &mut impl Write) -> Res<()> {
+        let flow = self.flow_model().feature(name)?;
+        let feat_ref = format!("refs/heads/{}", flow.branch);
+        let base_ref = format!("refs/heads/{}", flow.base);
+        if self.store.refs.get(&feat_ref).is_some() {
+            return Err(crate::machine::Failure::refusal(
+                "precondition_failed",
+                format!("a branch named '{}' already exists", flow.branch),
+            )
+            .into());
+        }
+        let base = self
+            .store
+            .refs
+            .resolve(&base_ref)?
+            .ok_or("develop branch missing; run 'alt flow init' first")?;
+        self.ensure_clean("flow start")?;
+
+        // the feature branch starts at develop's commit, so its tree equals
+        // develop's; materialize it (a no-op when already on develop)
+        let target = self.commit_entries(base)?;
+        let old = index_entries(&self.index()?);
+
+        let head_old = self.store.refs.get(&self.head_ref).cloned();
+        let head_ref = self.head_ref.clone();
+        self.commit_refs_checkout(
+            "flow",
+            &[
+                RefChange {
+                    name: feat_ref.clone(),
+                    old: None,
+                    new: Some(RefTarget::Oid(base)),
+                },
+                RefChange {
+                    name: head_ref,
+                    old: head_old,
+                    new: Some(RefTarget::Symbolic(feat_ref.clone())),
+                },
+            ],
+            &old,
+            &target,
+        )?;
+        if json {
+            use crate::json::Json;
+            crate::json::emit(
+                out,
+                vec![
+                    ("branch", Json::str(&flow.branch)),
+                    ("base", Json::str(flow.base)),
+                    ("commit", Json::str(base.to_string())),
+                ],
+            )?;
+        } else {
+            writeln!(out, "Switched to a new branch '{}'", flow.branch)?;
+        }
+        Ok(())
+    }
+
+    /// `alt flow feature finish <name>`: merge `feature/<name>` into `develop`,
+    /// delete the feature branch, and move HEAD to `develop` — all in one
+    /// atomic ref transaction (one op log entry → O(1) undo). Aborts if the
+    /// merge conflicts.
+    pub fn flow_feature_finish(&mut self, name: &str, json: bool, out: &mut impl Write) -> Res<()> {
+        let flow = self.flow_model().feature(name)?;
+        let feat_ref = format!("refs/heads/{}", flow.branch);
+        let dev_ref = format!("refs/heads/{}", flow.target);
+        let feat = self
+            .store
+            .refs
+            .resolve(&feat_ref)?
+            .ok_or_else(|| format!("no such feature branch '{}'", flow.branch))?;
+        let dev = self
+            .store
+            .refs
+            .resolve(&dev_ref)?
+            .ok_or("develop branch missing; run 'alt flow init' first")?;
+        self.ensure_clean("flow finish")?;
+
+        // merge the feature into develop without yet touching refs/work tree
+        let (new_dev, entries) = match self.compute_merge(dev, feat, &flow.branch)? {
+            MergeOutcome::UpToDate => (dev, self.commit_entries(dev)?),
+            MergeOutcome::FastForward(c) => (c, self.commit_entries(c)?),
+            MergeOutcome::Merged { commit, entries } => (commit, entries),
+            MergeOutcome::Conflicted(_) => {
+                return Err(format!(
+                    "merge of '{}' into '{}' has conflicts; \
+                     run 'alt merge' on '{}' and resolve manually",
+                    flow.branch, flow.target, flow.target
+                )
+                .into());
+            }
+        };
+
+        // one atomic op: advance develop, delete the feature, move HEAD
+        let head_old = self.store.refs.get(&self.head_ref).cloned();
+        let head_ref = self.head_ref.clone();
+        let old = index_entries(&self.index()?);
+        self.commit_refs_checkout(
+            "flow",
+            &[
+                RefChange {
+                    name: dev_ref.clone(),
+                    old: Some(RefTarget::Oid(dev)),
+                    new: Some(RefTarget::Oid(new_dev)),
+                },
+                RefChange {
+                    name: feat_ref.clone(),
+                    old: Some(RefTarget::Oid(feat)),
+                    new: None,
+                },
+                RefChange {
+                    name: head_ref,
+                    old: head_old,
+                    new: Some(RefTarget::Symbolic(dev_ref.clone())),
+                },
+            ],
+            &old,
+            &entries,
+        )?;
+
+        if json {
+            use crate::json::Json;
+            crate::json::emit(
+                out,
+                vec![
+                    ("target", Json::str(&flow.target)),
+                    ("commit", Json::str(new_dev.to_string())),
+                    ("deleted", Json::str(&flow.branch)),
+                ],
+            )?;
+        } else {
+            writeln!(
+                out,
+                "Merged '{}' into '{}' and deleted it",
+                flow.branch, flow.target
+            )?;
+        }
+        Ok(())
+    }
+
+    /// `alt flow release start <name>`: branch `release/<name>` off
+    /// `develop` and switch to it — same atomic-ref-tx structure as
+    /// feature start, just with a different base + branch prefix.
+    pub fn flow_release_start(&mut self, name: &str, json: bool, out: &mut impl Write) -> Res<()> {
+        let flow = self.flow_model().release(name)?;
+        self.flow_topic_start(&flow, json, out)
+    }
+
+    /// `alt flow release finish <name>`: merge `release/<name>` into
+    /// `main` *and* back-merge `main` into `develop`, delete the release
+    /// branch, move HEAD to `develop` — all in one ref-tx + one op-log
+    /// entry. A conflict on either merge aborts the whole flow (atomicity
+    /// keeps the prior state untouched).
+    pub fn flow_release_finish(&mut self, name: &str, json: bool, out: &mut impl Write) -> Res<()> {
+        let flow = self.flow_model().release(name)?;
+        let dev_ref = format!("refs/heads/{}", "develop");
+        self.flow_topic_finish_dual(&flow, &dev_ref, "release", json, out)
+    }
+
+    /// `alt flow hotfix start <name>`: branch `hotfix/<name>` off `main`
+    /// and switch to it.
+    pub fn flow_hotfix_start(&mut self, name: &str, json: bool, out: &mut impl Write) -> Res<()> {
+        let flow = self.flow_model().hotfix(name)?;
+        self.flow_topic_start(&flow, json, out)
+    }
+
+    /// `alt flow hotfix finish <name>`: merge `hotfix/<name>` into `main`
+    /// and back-merge into `develop`, delete the hotfix branch, move HEAD
+    /// to `develop`. Same atomic shape as release finish.
+    pub fn flow_hotfix_finish(&mut self, name: &str, json: bool, out: &mut impl Write) -> Res<()> {
+        let flow = self.flow_model().hotfix(name)?;
+        let dev_ref = format!("refs/heads/{}", "develop");
+        self.flow_topic_finish_dual(&flow, &dev_ref, "hotfix", json, out)
+    }
+
+    /// Shared start path for any flow whose start = "branch <topic> off
+    /// <base>, switch HEAD to topic". Single ref-tx, one op-log entry.
+    fn flow_topic_start(
+        &mut self,
+        flow: &alt_flow::Flow,
+        json: bool,
+        out: &mut impl Write,
+    ) -> Res<()> {
+        let topic_ref = format!("refs/heads/{}", flow.branch);
+        let base_ref = format!("refs/heads/{}", flow.base);
+        if self.store.refs.get(&topic_ref).is_some() {
+            return Err(crate::machine::Failure::refusal(
+                "precondition_failed",
+                format!("a branch named '{}' already exists", flow.branch),
+            )
+            .into());
+        }
+        let base = self.store.refs.resolve(&base_ref)?.ok_or_else(|| {
+            format!(
+                "base branch '{}' missing; run 'alt flow init' first",
+                flow.base
+            )
+        })?;
+        self.ensure_clean("flow start")?;
+
+        let target = self.commit_entries(base)?;
+        let old = index_entries(&self.index()?);
+
+        let head_old = self.store.refs.get(&self.head_ref).cloned();
+        let head_ref = self.head_ref.clone();
+        self.commit_refs_checkout(
+            "flow",
+            &[
+                RefChange {
+                    name: topic_ref.clone(),
+                    old: None,
+                    new: Some(RefTarget::Oid(base)),
+                },
+                RefChange {
+                    name: head_ref,
+                    old: head_old,
+                    new: Some(RefTarget::Symbolic(topic_ref.clone())),
+                },
+            ],
+            &old,
+            &target,
+        )?;
+        if json {
+            use crate::json::Json;
+            crate::json::emit(
+                out,
+                vec![
+                    ("branch", Json::str(&flow.branch)),
+                    ("base", Json::str(&flow.base)),
+                    ("commit", Json::str(base.to_string())),
+                ],
+            )?;
+        } else {
+            writeln!(out, "Switched to a new branch '{}'", flow.branch)?;
+        }
+        Ok(())
+    }
+
+    /// Shared dual-target finish: merge `flow.branch` into `flow.target`
+    /// AND back-merge `flow.target` into `back_ref` (develop, by
+    /// convention), delete the topic, move HEAD to `back_ref`. All in
+    /// one ref-tx. A conflict on either merge aborts.
+    fn flow_topic_finish_dual(
+        &mut self,
+        flow: &alt_flow::Flow,
+        back_ref: &str,
+        verb: &str,
+        json: bool,
+        out: &mut impl Write,
+    ) -> Res<()> {
+        let topic_ref = format!("refs/heads/{}", flow.branch);
+        let target_ref = format!("refs/heads/{}", flow.target);
+        let topic_oid = self
+            .store
+            .refs
+            .resolve(&topic_ref)?
+            .ok_or_else(|| format!("no such {verb} branch '{}'", flow.branch))?;
+        let target_oid = self
+            .store
+            .refs
+            .resolve(&target_ref)?
+            .ok_or_else(|| format!("{} branch missing", flow.target))?;
+        let back_oid = self
+            .store
+            .refs
+            .resolve(back_ref)?
+            .ok_or_else(|| format!("{back_ref} missing; run 'alt flow init' first"))?;
+        self.ensure_clean("flow finish")?;
+
+        // Step 1: merge the topic into its target (main, typically). A
+        // conflict here aborts without touching any ref.
+        let (new_target, target_entries) =
+            match self.compute_merge(target_oid, topic_oid, &flow.branch)? {
+                MergeOutcome::UpToDate => (target_oid, self.commit_entries(target_oid)?),
+                MergeOutcome::FastForward(c) => (c, self.commit_entries(c)?),
+                MergeOutcome::Merged { commit, entries } => (commit, entries),
+                MergeOutcome::Conflicted(_) => {
+                    return Err(format!(
+                        "merge of '{}' into '{}' has conflicts; \
+                     resolve manually before retrying the {verb} finish",
+                        flow.branch, flow.target
+                    )
+                    .into());
+                }
+            };
+
+        // Step 2: back-merge the (just-advanced) target into develop, so
+        // hotfixes/releases land on both main and develop. Conflict here
+        // aborts the whole flow — the prior state is untouched until the
+        // single ref-tx below commits.
+        let (new_back, back_entries) = if new_target == back_oid {
+            // back already points at the same commit (rare but possible
+            // when develop == main): no second merge to compute
+            (back_oid, target_entries.clone())
+        } else {
+            match self.compute_merge(back_oid, new_target, &flow.target)? {
+                MergeOutcome::UpToDate => (back_oid, self.commit_entries(back_oid)?),
+                MergeOutcome::FastForward(c) => (c, self.commit_entries(c)?),
+                MergeOutcome::Merged { commit, entries } => (commit, entries),
+                MergeOutcome::Conflicted(_) => {
+                    return Err(format!(
+                        "back-merge of '{}' into '{back_ref}' has conflicts; \
+                         resolve manually before retrying the {verb} finish",
+                        flow.target
+                    )
+                    .into());
+                }
+            }
+        };
+
+        // Step 3: one atomic ref-tx — advance target + advance back-ref +
+        // delete topic + move HEAD to back-ref. SIGKILL anywhere splits
+        // into pre/post only.
+        let head_old = self.store.refs.get(&self.head_ref).cloned();
+        let head_ref = self.head_ref.clone();
+        let mut changes = vec![
+            RefChange {
+                name: target_ref.clone(),
+                old: Some(RefTarget::Oid(target_oid)),
+                new: Some(RefTarget::Oid(new_target)),
+            },
+            RefChange {
+                name: topic_ref.clone(),
+                old: Some(RefTarget::Oid(topic_oid)),
+                new: None,
+            },
+            RefChange {
+                name: head_ref,
+                old: head_old,
+                new: Some(RefTarget::Symbolic(back_ref.to_owned())),
+            },
+        ];
+        // Only include the back-ref change when it actually moved — a
+        // RefChange with old == new is a no-op the refs layer would
+        // reject as a "no actual change".
+        if new_back != back_oid {
+            changes.push(RefChange {
+                name: back_ref.to_owned(),
+                old: Some(RefTarget::Oid(back_oid)),
+                new: Some(RefTarget::Oid(new_back)),
+            });
+        }
+        let old = index_entries(&self.index()?);
+        self.commit_refs_checkout("flow", &changes, &old, &back_entries)?;
+        if json {
+            use crate::json::Json;
+            crate::json::emit(
+                out,
+                vec![
+                    ("kind", Json::str(verb)),
+                    ("target", Json::str(&flow.target)),
+                    ("target_commit", Json::str(new_target.to_string())),
+                    (
+                        "back",
+                        Json::str(back_ref.trim_start_matches("refs/heads/")),
+                    ),
+                    ("back_commit", Json::str(new_back.to_string())),
+                    ("deleted", Json::str(&flow.branch)),
+                ],
+            )?;
+        } else {
+            writeln!(
+                out,
+                "Merged '{}' into '{}' and back-merged into '{back_ref}', deleted '{}'",
+                flow.branch, flow.target, flow.branch
+            )?;
+        }
+        Ok(())
+    }
+
+    /// `alt remote add <name> <url>`: register a git remote. Writes
+    /// `<alt-dir>/remotes/<name>` as a tiny `key=value` text file
+    /// (zero-serde, human-editable; same调性 as `.alt/policy`). Duplicate
+    /// names are rejected so `alt remote add origin <new-url>` doesn't
+    /// silently rewire an existing remote.
+    pub fn remote_add(
+        &mut self,
+        name: &str,
+        url: &str,
+        json: bool,
+        out: &mut impl Write,
+    ) -> Res<()> {
+        check_remote_name(name)?;
+        let path = self.remote_path(name);
+        if path.exists() {
+            return Err(format!("remote '{name}' already exists").into());
+        }
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        let fetch = default_fetch_refspec(name);
+        let body = format!("url={url}\nfetch={fetch}\n");
+        crate::durable::write(&path, body)?;
+        if json {
+            use crate::json::Json;
+            crate::json::emit(
+                out,
+                vec![
+                    ("name", Json::str(name)),
+                    ("url", Json::str(url)),
+                    ("fetch", Json::str(&fetch)),
+                ],
+            )?;
+        } else {
+            writeln!(out, "added remote '{name}' → {url}")?;
+        }
+        Ok(())
+    }
+
+    /// `alt remote list`: emit configured remotes (alphabetical). Empty
+    /// when no `remotes/` dir exists — a fresh repo has no remotes.
+    pub fn remote_list(&self, json: bool, out: &mut impl Write) -> Res<()> {
+        let remotes = self.read_remotes()?;
+        if json {
+            use crate::json::Json;
+            let arr = remotes
+                .iter()
+                .map(|r| {
+                    Json::Object(vec![
+                        ("name", Json::str(&r.name)),
+                        ("url", Json::str(&r.url)),
+                        ("fetch", Json::str(&r.fetch)),
+                    ])
+                })
+                .collect();
+            crate::json::emit(out, vec![("remotes", Json::Array(arr))])?;
+        } else {
+            for r in &remotes {
+                writeln!(out, "{}\t{}", r.name, r.url)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `alt remote remove <name>`: drop a configured remote. The
+    /// `refs/remotes/<name>/*` refs are *not* touched — removing the
+    /// remote config doesn't pretend the ingested history never happened.
+    pub fn remote_remove(&mut self, name: &str, json: bool, out: &mut impl Write) -> Res<()> {
+        let path = self.remote_path(name);
+        if !path.exists() {
+            return Err(format!("no such remote '{name}'").into());
+        }
+        crate::durable::remove_file(&path)?;
+        if json {
+            use crate::json::Json;
+            crate::json::emit(out, vec![("removed", Json::str(name))])?;
+        } else {
+            writeln!(out, "removed remote '{name}'")?;
+        }
+        Ok(())
+    }
+
+    fn remote_path(&self, name: &str) -> PathBuf {
+        self.store.alt_dir.join("remotes").join(name)
+    }
+
+    /// `alt identity init [<principal>]`: generate a fresh Ed25519
+    /// keypair under `<alt-dir>/identity/<principal>.{pub,sec}`. The
+    /// secret file is created with mode 0600; the public file is 0644
+    /// (it's safe to share). Refuses to overwrite an existing pair so a
+    /// rerun never silently swaps a principal's key.
+    pub fn identity_init(
+        &self,
+        principal: Option<&str>,
+        json: bool,
+        out: &mut impl Write,
+    ) -> Res<()> {
+        let principal = match principal {
+            Some(p) => p.to_owned(),
+            None => self.id.principal.id.clone(),
+        };
+        check_principal_id(&principal)?;
+        let dir = self.store.alt_dir.join("identity");
+        std::fs::create_dir_all(&dir)?;
+        let pub_path = dir.join(format!("{principal}.pub"));
+        let sec_path = dir.join(format!("{principal}.sec"));
+        if pub_path.exists() || sec_path.exists() {
+            return Err(
+                format!("identity '{principal}' already exists; refuse to overwrite").into(),
+            );
+        }
+        let (sec, pub_) = alt_sign::SecretKey::generate();
+        crate::durable::write(&pub_path, pub_.to_text())?;
+        write_secret_file(&sec_path, sec.to_text().as_bytes())?;
+        if json {
+            use crate::json::Json;
+            crate::json::emit(
+                out,
+                vec![
+                    ("principal", Json::str(&principal)),
+                    ("pub_path", Json::str(pub_path.display().to_string())),
+                    ("sec_path", Json::str(sec_path.display().to_string())),
+                ],
+            )?;
+        } else {
+            writeln!(
+                out,
+                "Generated Ed25519 identity '{principal}':\n  {}\n  {}",
+                pub_path.display(),
+                sec_path.display(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// `alt identity list`: emit installed identities (public-side rows
+    /// only; secrets are never displayed). Each row shows the principal
+    /// id and a short fingerprint (first 16 hex chars of the pubkey).
+    pub fn identity_list(&self, json: bool, out: &mut impl Write) -> Res<()> {
+        let dir = self.store.alt_dir.join("identity");
+        let trust_dir = self.store.alt_dir.join("trust");
+        let mut rows = read_pubkey_dir(&dir)?;
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        let trust: Vec<(String, alt_sign::PublicKey)> = read_pubkey_dir(&trust_dir)?;
+        if json {
+            use crate::json::Json;
+            let identities: Vec<Json> = rows
+                .iter()
+                .map(|(name, key)| {
+                    let trusted = trust
+                        .iter()
+                        .any(|(n, k)| n == name && k.as_bytes() == key.as_bytes());
+                    Json::Object(vec![
+                        ("principal", Json::str(name)),
+                        ("fingerprint", Json::str(fingerprint(key))),
+                        ("trusted", Json::Bool(trusted)),
+                    ])
+                })
+                .collect();
+            crate::json::emit(out, vec![("identities", Json::Array(identities))])?;
+        } else {
+            for (name, key) in &rows {
+                let trusted = trust
+                    .iter()
+                    .any(|(n, k)| n == name && k.as_bytes() == key.as_bytes());
+                let trust_tag = if trusted { " trusted" } else { "" };
+                writeln!(out, "{name}\t{}{trust_tag}", fingerprint(key))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `alt identity trust <principal> <pub-file>`: install a public key
+    /// into `<alt-dir>/trust/<principal>.pub`. The op verifies the
+    /// pub-file parses as an `alt-pubkey-ed25519:` key — a typo in the
+    /// path fails loudly here, not at signature-verify time.
+    pub fn identity_trust(
+        &self,
+        principal: &str,
+        pub_file: &Path,
+        json: bool,
+        out: &mut impl Write,
+    ) -> Res<()> {
+        check_principal_id(principal)?;
+        let text = std::fs::read_to_string(pub_file)?;
+        let key = alt_sign::PublicKey::from_text(&text)
+            .map_err(|e| format!("not a valid alt pubkey at '{}': {e}", pub_file.display()))?;
+        let dir = self.store.alt_dir.join("trust");
+        std::fs::create_dir_all(&dir)?;
+        let dst = dir.join(format!("{principal}.pub"));
+        crate::durable::write(&dst, key.to_text())?;
+        if json {
+            use crate::json::Json;
+            crate::json::emit(
+                out,
+                vec![
+                    ("principal", Json::str(principal)),
+                    ("fingerprint", Json::str(fingerprint(&key))),
+                    ("trust_path", Json::str(dst.display().to_string())),
+                ],
+            )?;
+        } else {
+            writeln!(
+                out,
+                "Trusted '{principal}' (fingerprint {})",
+                fingerprint(&key)
+            )?;
+        }
+        Ok(())
+    }
+
+    fn read_remotes(&self) -> Res<Vec<Remote>> {
+        let dir = self.store.alt_dir.join("remotes");
+        let mut out = Vec::new();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e.into()),
+        };
+        let mut paths: Vec<_> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        paths.sort();
+        for p in paths {
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_owned)
+                .ok_or("non-utf8 remote name")?;
+            let body = std::fs::read_to_string(&p)?;
+            let mut url = String::new();
+            let mut fetch = default_fetch_refspec(&name);
+            for line in body.lines() {
+                let Some((k, v)) = line.split_once('=') else {
+                    continue;
+                };
+                match k.trim() {
+                    "url" => url = v.trim().to_owned(),
+                    "fetch" => fetch = v.trim().to_owned(),
+                    _ => {} // forward-compat: unknown keys ignored
+                }
+            }
+            out.push(Remote { name, url, fetch });
+        }
+        Ok(out)
+    }
+
+    /// `alt fetch <remote> [refspecs…]`: ls-refs the remote, request the
+    /// objects reachable from each matched server ref, ingest the streamed
+    /// packfile into the native odb, and update `refs/remotes/<remote>/*`
+    /// in one ref transaction.
+    ///
+    /// The fetch is a self-contained round-trip — `done\n` short-circuits
+    /// negotiation, so the server sends acknowledgments-free and we always
+    /// receive a full (non-thin) pack. Incremental fetch (real haves) and
+    /// thin-pack ingest are follow-up steps once they buy real dogfood.
+    ///
+    /// Auth: per-remote env vars `ALT_HTTP_USER_<NAME>` +
+    /// `ALT_HTTP_TOKEN_<NAME>` (uppercased, hyphen→underscore). Falls back
+    /// to anonymous (public read).
+    pub fn fetch(
+        &mut self,
+        remote_name: &str,
+        refspecs: &[String],
+        json: bool,
+        out: &mut impl Write,
+    ) -> Res<()> {
+        let remotes = self.read_remotes()?;
+        let remote = remotes
+            .iter()
+            .find(|r| r.name == remote_name)
+            .ok_or_else(|| format!("no such remote '{remote_name}'"))?;
+
+        let specs: Vec<RefSpec> = if refspecs.is_empty() {
+            vec![RefSpec::parse(&remote.fetch)?]
+        } else {
+            refspecs
+                .iter()
+                .map(|s| RefSpec::parse(s))
+                .collect::<Result<_, _>>()?
+        };
+
+        // Apply `[url "X"] insteadOf = Y` rewrites from the repo's git
+        // config before handing the URL to the transport. The most
+        // common payoff is rewriting SSH-style URLs to HTTPS so alt's
+        // git-smart-http transport can take them.
+        let rewritten_url = {
+            let repo = alt_repo::Repository::discover(&self.store.alt_dir)?;
+            repo.rewrite_url(&remote.url)
+        };
+        let transport = build_transport(&remote.name, &rewritten_url);
+
+        // capability advertisement — surfaces the protocol version and the
+        // server's offered commands; we only need to know v2 is supported
+        let ad_bytes = transport.info_refs(alt_wire_http::Service::UploadPack)?;
+        let ad =
+            alt_wire::parse_capability_advertisement(&mut ad_bytes.as_slice(), "git-upload-pack")?;
+        if ad.version != 2 {
+            return Err(format!("server speaks protocol v{}, want v2", ad.version).into());
+        }
+        let object_format = ad.object_format.as_deref();
+        let algo = parse_object_format(object_format)?;
+
+        // ls-refs: get the server's full ref list (heads + tags + HEAD)
+        let mut ls_body = Vec::new();
+        alt_wire::encode_ls_refs_request(
+            &mut ls_body,
+            &alt_wire::LsRefsRequest {
+                symrefs: true,
+                peel: true,
+                ref_prefixes: vec!["refs/heads/".into(), "refs/tags/".into(), "HEAD".into()],
+            },
+            object_format,
+        )?;
+        let ls_resp = transport.command(alt_wire_http::Service::UploadPack, &ls_body)?;
+        let server_refs = alt_wire::parse_ls_refs_response(&mut ls_resp.as_slice(), algo)?;
+
+        // refspec match: server refs → local destinations + wants
+        let mut updates: Vec<RefUpdate> = Vec::new();
+        let mut wants: Vec<ObjectId> = Vec::new();
+        // capture the server's HEAD symref target so we can mirror it as
+        // `refs/remotes/<name>/HEAD` (what git clones do — a clone needs
+        // it to know which branch to check out)
+        let server_head_target: Option<String> = server_refs.iter().find_map(|r| {
+            if r.name == "HEAD" {
+                r.symref_target.clone()
+            } else {
+                None
+            }
+        });
+
+        for sref in &server_refs {
+            if sref.name == "HEAD" {
+                continue; // tracked via symref-target on the matched branch
+            }
+            for spec in &specs {
+                let Some(local_name) = spec.map(&sref.name) else {
+                    continue;
+                };
+                let old = match self.store.refs.get(&local_name) {
+                    Some(RefTarget::Oid(o)) => Some(*o),
+                    _ => None,
+                };
+                updates.push(RefUpdate {
+                    server_name: sref.name.clone(),
+                    local_name,
+                    new: sref.oid,
+                    old,
+                });
+                wants.push(sref.oid);
+                break;
+            }
+        }
+        // dedup wants (same oid may back several refs)
+        wants.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        wants.dedup();
+
+        if wants.is_empty() {
+            if json {
+                use crate::json::Json;
+                crate::json::emit(
+                    out,
+                    vec![
+                        ("remote", Json::str(remote_name)),
+                        ("objects", Json::Num(0)),
+                        ("refs", Json::Array(Vec::new())),
+                    ],
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    "fetch '{remote_name}': nothing to do (no matching refs)"
+                )?;
+            }
+            return Ok(());
+        }
+
+        // haves: tips of every ref we already track for this remote. The
+        // server uses these to bound the pack it sends; with `done\n` it
+        // skips the negotiation round-trip but still trims unreachable
+        // objects from the pack.
+        let haves = self.collect_haves(remote_name)?;
+
+        let mut fetch_body = Vec::new();
+        alt_wire::encode_fetch_request(
+            &mut fetch_body,
+            &alt_wire::FetchRequest {
+                wants: wants.clone(),
+                haves,
+                done: true,
+                ofs_delta: true,
+                no_progress: true,
+                ..Default::default()
+            },
+            object_format,
+        )?;
+        let fetch_resp = transport.command(alt_wire_http::Service::UploadPack, &fetch_body)?;
+
+        // drain preamble + sideband-wrapped pack stream into a temp .pack
+        let pack_dir = self.store.alt_dir.join("pack");
+        std::fs::create_dir_all(&pack_dir)?;
+        let tmp_pack = pack_dir.join(format!("fetch-{}-incoming.pack", remote_name));
+        let mut reader = fetch_resp.as_slice();
+        let preamble = alt_wire::read_fetch_preamble(&mut reader, algo)?;
+        if preamble.packfile_missing {
+            return Err("server returned no packfile (negotiation incomplete)".into());
+        }
+        let bytes_written = {
+            let mut sink = std::fs::File::create(&tmp_pack)?;
+            let n = alt_wire::drain_packfile(&mut reader, &mut sink, |_| {})?;
+            sink.sync_all()?;
+            n
+        };
+        if bytes_written == 0 {
+            // server said "nothing new" — drop the empty file, skip indexing
+            let _ = crate::durable::remove_file(&tmp_pack);
+        } else {
+            // index the pack and ingest its objects into the native odb
+            let indexed = alt_git_pack::index_pack(&tmp_pack, algo, true)
+                .map_err(|e| format!("index-pack failed: {e}"))?;
+            let ip = alt_git_pack::IndexedPack::open(&indexed.pack_path, algo)?;
+            let idx = ip.idx();
+            let mut order: Vec<(u64, u32)> = (0..idx.len())
+                .map(|i| (idx.offset_at(i).expect("idx in range"), i))
+                .collect();
+            order.sort_unstable();
+            for (offset, i) in order {
+                let obj = ip.read_at(offset)?;
+                self.store.odb.put(idx.oid_at(i), obj.kind, &obj.data)?;
+            }
+            self.store.odb.flush()?;
+        }
+
+        // ref transaction: one tx for all the remote-tracking refs (plus
+        // the mirrored remote HEAD when the server advertised a symref)
+        let mut changes: Vec<RefChange> = updates
+            .iter()
+            .filter(|u| u.old != Some(u.new))
+            .map(|u| RefChange {
+                name: u.local_name.clone(),
+                old: u.old.map(RefTarget::Oid),
+                new: Some(RefTarget::Oid(u.new)),
+            })
+            .collect();
+        if let Some(target) = &server_head_target {
+            // map `refs/heads/main` → `refs/remotes/<name>/main`, using the
+            // first matching spec; skip when the server's HEAD points at a
+            // branch our refspec wouldn't have fetched
+            let local_target = specs.iter().find_map(|s| s.map(target));
+            if let Some(local_target) = local_target {
+                let remote_head_name = format!("refs/remotes/{remote_name}/HEAD");
+                let current = match self.store.refs.get(&remote_head_name) {
+                    Some(RefTarget::Symbolic(s)) => Some(RefTarget::Symbolic(s.clone())),
+                    Some(RefTarget::Oid(o)) => Some(RefTarget::Oid(*o)),
+                    None => None,
+                };
+                let new_target = RefTarget::Symbolic(local_target);
+                if current.as_ref() != Some(&new_target) {
+                    changes.push(RefChange {
+                        name: remote_head_name,
+                        old: current,
+                        new: Some(new_target),
+                    });
+                }
+            }
+        }
+        if !changes.is_empty() {
+            self.commit_refs_only("fetch", &changes)?;
+        }
+
+        if json {
+            use crate::json::Json;
+            let refs_json: Vec<Json> = updates
+                .iter()
+                .map(|u| {
+                    Json::Object(vec![
+                        ("server", Json::str(&u.server_name)),
+                        ("local", Json::str(&u.local_name)),
+                        ("oid", Json::str(u.new.to_string())),
+                        (
+                            "old",
+                            match u.old {
+                                Some(o) => Json::str(o.to_string()),
+                                None => Json::Null,
+                            },
+                        ),
+                    ])
+                })
+                .collect();
+            crate::json::emit(
+                out,
+                vec![
+                    ("remote", Json::str(remote_name)),
+                    ("objects", Json::Num(wants.len() as i64)),
+                    ("pack_bytes", Json::Num(bytes_written as i64)),
+                    ("refs", Json::Array(refs_json)),
+                ],
+            )?;
+        } else {
+            writeln!(
+                out,
+                "fetch '{}': {} ref(s), {} byte(s) of packfile",
+                remote_name,
+                updates.len(),
+                bytes_written
+            )?;
+            for u in &updates {
+                let status = match u.old {
+                    None => "new",
+                    Some(o) if o == u.new => "up-to-date",
+                    Some(_) => "updated",
+                };
+                writeln!(out, "  {status:>10}  {} -> {}", u.server_name, u.local_name)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `alt push <remote> [<refspec>…]`: send the objects reachable from
+    /// the local tips the refspec selects, ask the server to update the
+    /// matching refs (git smart-http v1 receive-pack).
+    ///
+    /// Refspec forms (no wildcards yet):
+    /// - `<src>` → push local `refs/heads/<src>` to remote `refs/heads/<src>`.
+    /// - `<src>:<dst>` → push local `<src>` to remote `<dst>`. `<src>` is
+    ///   resolved through the same DWIM order as `alt switch`: branch
+    ///   short-name, then full ref.
+    /// - empty refspec list → push the current branch onto itself.
+    ///
+    /// Force (`-f`): adds the `+` semantics; the server's own policy
+    /// (e.g. branch protection) still decides whether to accept.
+    pub fn push(
+        &mut self,
+        remote_name: &str,
+        refspecs: &[String],
+        force: bool,
+        json: bool,
+        out: &mut impl Write,
+    ) -> Res<()> {
+        let remotes = self.read_remotes()?;
+        let remote = remotes
+            .iter()
+            .find(|r| r.name == remote_name)
+            .ok_or_else(|| format!("no such remote '{remote_name}'"))?;
+
+        // Apply `[url "X"] insteadOf = Y` rewrites from the repo's git
+        // config before handing the URL to the transport. The most
+        // common payoff is rewriting SSH-style URLs to HTTPS so alt's
+        // git-smart-http transport can take them.
+        let rewritten_url = {
+            let repo = alt_repo::Repository::discover(&self.store.alt_dir)?;
+            repo.rewrite_url(&remote.url)
+        };
+        let transport = build_transport(&remote.name, &rewritten_url);
+
+        // v1 ref advertisement: the receive-pack endpoint speaks v1 even
+        // when we ask for v2 (push isn't in protocol v2 in upstream git)
+        let ad_bytes = transport.info_refs(alt_wire_http::Service::ReceivePack)?;
+        let ad = alt_wire::parse_v1_ref_advertisement(&mut ad_bytes.as_slice(), self.store.algo)?;
+        if !ad.supports("report-status") {
+            return Err("remote does not support report-status".into());
+        }
+        // pick up the server-issued single-use nonce if it
+        // advertised one. `maybe_sign_push` will then sign over
+        // `nonce <hex>\n` + canonical payload, and we echo the same
+        // value back as `alt-nonce=<hex>` on the push capability list
+        // so the server can look it up.
+        let server_nonce: Option<String> = ad.cap_value(alt_wire::CAP_ALT_NONCE).map(str::to_owned);
+
+        // resolve the refspecs to (local oid, remote ref name) pairs
+        let parsed = if refspecs.is_empty() {
+            let branch = self.head_branch()?;
+            vec![PushSpec {
+                src: branch.clone(),
+                dst: branch,
+                force,
+            }]
+        } else {
+            refspecs
+                .iter()
+                .map(|s| PushSpec::parse(s, force))
+                .collect::<Result<_, _>>()?
+        };
+
+        let mut updates: Vec<alt_wire::RefUpdate> = Vec::new();
+        let mut local_tips: Vec<ObjectId> = Vec::new();
+        for spec in &parsed {
+            let src_full = canonicalise_local_ref(&spec.src);
+            let dst_full = canonicalise_remote_ref(&spec.dst);
+            let new = match self.store.refs.get(&src_full) {
+                Some(RefTarget::Oid(o)) => *o,
+                Some(RefTarget::Symbolic(_)) => {
+                    return Err(format!("'{src_full}' is symbolic; resolve it first").into());
+                }
+                None => {
+                    return Err(format!("local ref '{src_full}' does not exist").into());
+                }
+            };
+            let old = ad.refs.get(&dst_full).copied();
+            updates.push(alt_wire::RefUpdate {
+                old,
+                new: Some(new),
+                name: dst_full,
+            });
+            local_tips.push(new);
+        }
+
+        if updates.iter().all(|u| u.old == u.new) {
+            if json {
+                use crate::json::Json;
+                crate::json::emit(
+                    out,
+                    vec![
+                        ("remote", Json::str(remote_name)),
+                        ("updated", Json::Bool(false)),
+                        ("refs", Json::Array(Vec::new())),
+                    ],
+                )?;
+            } else {
+                writeln!(out, "push '{remote_name}': everything up to date")?;
+            }
+            return Ok(());
+        }
+
+        // cross-party pre-check: run the local capability
+        // policy against the would-be ref changes BEFORE going to the
+        // wire. The server enforces its own policy (which we can't always
+        // know up-front), but the local gate stops a forbidden push from
+        // leaking the pack body onto the network at all.
+        let pseudo_changes: Vec<RefChange> = updates
+            .iter()
+            .filter(|u| u.old != u.new)
+            .map(|u| RefChange {
+                name: u.name.clone(),
+                old: u.old.map(RefTarget::Oid),
+                new: u.new.map(RefTarget::Oid),
+            })
+            .collect();
+        self.ensure_writable("push")?;
+        self.ensure_no_force(&pseudo_changes)?;
+        self.ensure_push_branch_allowed(&pseudo_changes)?;
+        if !force {
+            self.ensure_fast_forward(&pseudo_changes)?;
+        }
+
+        // compute outgoing object set: reachable(local tips) \ reachable(server tips)
+        let repo = alt_repo::Repository::discover(&self.store.alt_dir)?;
+        let excludes: Vec<ObjectId> = ad.refs.values().copied().collect();
+        let outgoing = repo.reachable_objects(&local_tips, &excludes)?;
+
+        // write a plain pack (no deltas) of the outgoing set into a
+        // scratch dir under `<alt-dir>/tmp_push/`; we don't need it as a
+        // stored pack, just as the wire body, so it's removed after the
+        // request completes
+        let pack_dir = self
+            .store
+            .alt_dir
+            .join("tmp_push")
+            .join(format!("push-{remote_name}"));
+        std::fs::create_dir_all(&pack_dir)?;
+        let pack_bytes = if outgoing.is_empty() {
+            // a delete-only push or no-op push still needs to send
+            // *something* per the v1 protocol — but in practice servers
+            // accept an empty body when no commands ship a pack
+            Vec::new()
+        } else {
+            let count =
+                u32::try_from(outgoing.len()).map_err(|_| "outgoing object set exceeds u32")?;
+            let mut writer = alt_git_pack::PackWriter::create(&pack_dir, self.store.algo, count)?;
+            for (oid, kind) in &outgoing {
+                let obj = repo
+                    .read_object(oid)?
+                    .ok_or_else(|| format!("outgoing object {oid} not in odb"))?;
+                writer.add(*oid, *kind, &obj.data)?;
+            }
+            let written = writer.finish()?;
+            std::fs::read(&written.pack_path)?
+        };
+        // best-effort cleanup; not fatal if the dir is busy
+        let _ = crate::durable::remove_dir_all(&pack_dir);
+
+        // capabilities to declare on the push request
+        let agent = format!("agent=alt/{}", env!("CARGO_PKG_VERSION"));
+        let mut caps_owned: Vec<String> = vec![
+            "report-status".into(),
+            "ofs-delta".into(),
+            "side-band-64k".into(),
+            agent,
+        ];
+        // alt-to-alt private extension: when local signing policy
+        // is enabled and we have a sec key on disk, sign the canonical
+        // push payload and attach `alt-principal=<id>` +
+        // `alt-sig=alt-sig-ed25519:<sig>` to the cap list. Git's
+        // receive-pack silently ignores unknown caps; an alt server
+        // looks for the pair and verifies it against its trust store.
+        if let Some((principal, sig_text)) =
+            self.maybe_sign_push(&updates, server_nonce.as_deref())?
+        {
+            caps_owned.push(format!("{}={principal}", alt_wire::CAP_ALT_PRINCIPAL));
+            caps_owned.push(format!("{}={sig_text}", alt_wire::CAP_ALT_SIG));
+            if let Some(n) = &server_nonce {
+                caps_owned.push(format!("{}={n}", alt_wire::CAP_ALT_NONCE));
+            }
+        }
+        let caps_refs: Vec<&str> = caps_owned.iter().map(String::as_str).collect();
+
+        let mut body = Vec::new();
+        alt_wire::encode_push_request(
+            &mut body,
+            &updates,
+            &caps_refs,
+            self.store.algo,
+            &pack_bytes,
+        )?;
+        let resp = transport.command(alt_wire_http::Service::ReceivePack, &body)?;
+
+        // we requested side-band-64k, so the report rides on band 1
+        let report = alt_wire::parse_report_status_sideband(&mut resp.as_slice(), |_| {})?;
+
+        // surface failures: an unpack error or any ng line fails the
+        // command (non-zero exit), so the caller knows nothing on the
+        // server moved
+        if let Err(reason) = &report.unpack {
+            return Err(format!("server rejected push: unpack {reason}").into());
+        }
+        let mut any_ng = false;
+        for s in &report.commands {
+            if let alt_wire::CommandStatus::Ng { .. } = s {
+                any_ng = true;
+            }
+        }
+
+        // render and (locally) record the push as an op so it shows up in
+        // op-log; the local ref state didn't change, so we don't commit a
+        // ref tx — this is purely an audit marker, omitted here to keep
+        // scope tight
+        if json {
+            use crate::json::Json;
+            let refs_json: Vec<Json> = report
+                .commands
+                .iter()
+                .map(|s| match s {
+                    alt_wire::CommandStatus::Ok(name) => {
+                        Json::Object(vec![("name", Json::str(name)), ("status", Json::str("ok"))])
+                    }
+                    alt_wire::CommandStatus::Ng { name, reason } => Json::Object(vec![
+                        ("name", Json::str(name)),
+                        ("status", Json::str("ng")),
+                        ("reason", Json::str(reason)),
+                    ]),
+                })
+                .collect();
+            crate::json::emit(
+                out,
+                vec![
+                    ("remote", Json::str(remote_name)),
+                    ("objects", Json::Num(outgoing.len() as i64)),
+                    ("pack_bytes", Json::Num(pack_bytes.len() as i64)),
+                    ("refs", Json::Array(refs_json)),
+                ],
+            )?;
+        } else {
+            writeln!(
+                out,
+                "push '{}': {} object(s), {} byte(s)",
+                remote_name,
+                outgoing.len(),
+                pack_bytes.len()
+            )?;
+            for s in &report.commands {
+                match s {
+                    alt_wire::CommandStatus::Ok(name) => writeln!(out, "  ok       {name}")?,
+                    alt_wire::CommandStatus::Ng { name, reason } => {
+                        writeln!(out, "  rejected {name}: {reason}")?
+                    }
+                }
+            }
+        }
+        if any_ng {
+            return Err("server rejected one or more refs".into());
+        }
+        Ok(())
+    }
+
+    /// Tip oids of every `refs/remotes/<remote>/*` we already track — the
+    /// `have` lines for an incremental fetch.
+    fn collect_haves(&self, remote_name: &str) -> Res<Vec<ObjectId>> {
+        let prefix = format!("refs/remotes/{remote_name}/");
+        let mut out = Vec::new();
+        for (name, target) in self.store.refs.iter() {
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            if let RefTarget::Oid(o) = target {
+                out.push(*o);
+            }
+        }
+        Ok(out)
+    }
+
+    /// `alt op-log`: audit-view the op log, newest first. Each entry surfaces
+    /// the structured principal (parsed from the actor string) and, for
+    /// ref-transaction payloads, the list of ref changes that op made. Other
+    /// payload kinds (e.g. import) appear with `ref_changes = null` so the
+    /// audit trail is complete even for non-ref ops.
+    ///
+    /// Reads the on-disk op log directly — no refresh / no lock — so it stays
+    /// idempotent and routes through the daemon harmlessly (cf. `log`). A
+    /// concurrent writer might add an op between two reads; the audit
+    /// snapshot is just truncated, never inconsistent.
+    pub fn op_log(
+        &self,
+        max_count: Option<usize>,
+        json: bool,
+        verify: bool,
+        out: &mut impl Write,
+    ) -> Res<()> {
+        let oplog = alt_oplog::OpLog::open(&self.store.alt_dir.join("oplog"))?;
+        let limit = max_count.unwrap_or(usize::MAX);
+        // newest first matches `alt log` and what an auditor naturally wants
+        let entries: Vec<&alt_oplog::Op> = oplog.ops().iter().rev().take(limit).collect();
+
+        // when --verify is asked, pre-compute the verdict for each op id
+        // up front so the per-op rendering doesn't pay an N×M cost
+        let verdicts = if verify {
+            verify_oplog_signatures(&self.store.alt_dir, &entries)?
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        if json {
+            return render_op_log_json(out, &entries, &verdicts);
+        }
+        for op in &entries {
+            let (principal, verb) = Principal::parse_actor(&op.actor);
+            let kind_str = match principal.kind {
+                PrincipalKind::Human => "human",
+                PrincipalKind::Agent => "agent",
+            };
+            let session = principal.session.as_deref().unwrap_or("-");
+            let sig_tag = match verdicts.get(&op.id) {
+                Some(SigVerdict::Ok { principal }) => format!(" sig=signed-ok:{principal}"),
+                Some(SigVerdict::Unsigned) => " sig=unsigned".to_owned(),
+                Some(SigVerdict::Bad { principal }) => format!(" sig=bad-sig:{principal}"),
+                Some(SigVerdict::Untrusted { principal }) => {
+                    format!(" sig=untrusted:{principal}")
+                }
+                None => String::new(),
+            };
+            writeln!(
+                out,
+                "{ts} {kind_str}:{id} session={sess} verb={verb}{sig_tag}",
+                ts = op.timestamp_ms,
+                id = principal.id,
+                sess = session,
+            )?;
+            if let Some(tx) = parse_ref_tx_or_none(&op.payload)? {
+                for c in &tx.changes {
+                    writeln!(
+                        out,
+                        "  ref {name}: {old} -> {new}",
+                        name = c.name,
+                        old = render_target(&c.old),
+                        new = render_target(&c.new),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `alt verify`: for each `commits` oid (or each commit
+    /// reachable from HEAD up to `max_count` when the list is empty),
+    /// read the commit object, parse its `alt-sig` header, and verify
+    /// against the repo's trust store. Renders one row per commit:
+    ///
+    ///   <oid> signed-ok:<principal>
+    ///   <oid> unsigned
+    ///   <oid> bad-sig:<principal>
+    ///   <oid> untrusted:<principal>
+    ///
+    /// With `--json`, emits the same data as a structured list so
+    /// scripts don't have to parse the human view.
+    pub fn verify_commits(
+        &mut self,
+        commits: &[String],
+        max_count: Option<usize>,
+        json: bool,
+        out: &mut impl Write,
+    ) -> Res<()> {
+        // Resolve the set of commit oids to check
+        let oids: Vec<ObjectId> = if commits.is_empty() {
+            self.head_commit_chain(max_count.unwrap_or(50))?
+        } else {
+            commits
+                .iter()
+                .map(|s| {
+                    ObjectId::from_hex(s.as_bytes())
+                        .map_err(|e| format!("bad commit oid {s:?}: {e}").into())
+                })
+                .collect::<Result<_, Box<dyn std::error::Error>>>()?
+        };
+
+        let trust = self.store.trust_keys()?;
+        let verdicts: Vec<(ObjectId, CommitSigVerdict)> = oids
+            .into_iter()
+            .map(|oid| {
+                let verdict = match self.store.odb_get(&oid)? {
+                    Some(obj) if obj.kind == ObjectKind::Commit => {
+                        verdict_for_commit(&obj.data, &trust)
+                    }
+                    Some(_) => CommitSigVerdict::NotACommit,
+                    None => CommitSigVerdict::Missing,
+                };
+                Ok((oid, verdict))
+            })
+            .collect::<Res<Vec<_>>>()?;
+
+        if json {
+            use crate::json::Json;
+            let rows: Vec<Json> = verdicts
+                .iter()
+                .map(|(oid, v)| {
+                    Json::Object(vec![
+                        ("commit", Json::str(oid.to_string())),
+                        ("verdict", Json::str(v.tag())),
+                        match v.principal() {
+                            Some(p) => ("principal", Json::str(p)),
+                            None => ("principal", Json::Null),
+                        },
+                    ])
+                })
+                .collect();
+            crate::json::emit(out, vec![("commits", Json::Array(rows))])?;
+        } else {
+            for (oid, v) in &verdicts {
+                writeln!(out, "{oid} {}", v.render())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Walk parents from HEAD back to root, breadth-first first-parent,
+    /// capped at `limit`. Used by `alt verify` when no oids are given.
+    fn head_commit_chain(&self, limit: usize) -> Res<Vec<ObjectId>> {
+        let branch = self.head_branch()?;
+        let Some(mut current) = self.store.refs.resolve(&branch)? else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for _ in 0..limit {
+            out.push(current);
+            let raw = match self.store.odb.get(&current)? {
+                Some(r) if r.kind == ObjectKind::Commit => r,
+                _ => break,
+            };
+            let commit = alt_git_codec::Commit::parse(&raw.data)?;
+            match commit.parents().next() {
+                Some(p) => current = p,
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// Advances `branch` from `old` to `new` in one ref transaction.
+    fn advance_branch_checkout(
+        &mut self,
+        branch: &str,
+        old: ObjectId,
+        new: ObjectId,
+        before: &[WorkEntry],
+        after: &[WorkEntry],
+    ) -> Res<()> {
+        self.commit_refs_checkout(
+            "merge",
+            &[RefChange {
+                name: branch.to_owned(),
+                old: Some(RefTarget::Oid(old)),
+                new: Some(RefTarget::Oid(new)),
+            }],
+            before,
+            after,
+        )?;
+        Ok(())
+    }
+}
+
+/// Renders `status` as the stable JSON schema (version 1):
+/// `{schema_version, branch, principal:{kind,id,session?}, staged:[…],
+/// unstaged:[…], untracked:[…], unmerged:[…], clean}`. `change` ∈
+/// `added`/`modified`/`deleted`; `principal` is the structured actor, so
+/// an agent can self-check "who am I to this repo" via the same
+/// machine-first surface it uses for everything else.
+fn render_status_json(
+    out: &mut impl Write,
+    branch: &str,
+    principal: &Principal,
+    st: &alt_worktree::Status,
+    unmerged: &std::collections::BTreeSet<BString>,
+) -> Res<()> {
+    use crate::json::Json;
+    let change = |k: ChangeKind| match k {
+        ChangeKind::Added => "added",
+        ChangeKind::Modified => "modified",
+        ChangeKind::Deleted => "deleted",
+    };
+    let entries = |v: &[(BString, ChangeKind)]| {
+        Json::Array(
+            v.iter()
+                .map(|(p, k)| {
+                    Json::Object(vec![
+                        ("path", Json::str(p)),
+                        ("change", Json::str(change(*k))),
+                    ])
+                })
+                .collect(),
+        )
+    };
+    let paths = |it: &mut dyn Iterator<Item = &BString>| Json::Array(it.map(Json::str).collect());
+    let clean = unmerged.is_empty()
+        && st.staged.is_empty()
+        && st.unstaged.is_empty()
+        && st.untracked.is_empty();
+    let doc = Json::Object(vec![
+        ("schema_version", Json::Num(1)),
+        ("branch", Json::str(branch)),
+        ("principal", principal_json(principal)),
+        ("staged", entries(&st.staged)),
+        ("unstaged", entries(&st.unstaged)),
+        ("untracked", paths(&mut st.untracked.iter())),
+        ("unmerged", paths(&mut unmerged.iter())),
+        ("clean", Json::Bool(clean)),
+    ]);
+    doc.write(out)?;
+    out.write_all(b"\n")?;
+    Ok(())
+}
+
+/// JSON shape for a perceptual hint:
+/// `{kind:"perceptual_diff", prism, distance}` where `prism` is the
+/// content kind (`"png"` today) and `distance` is the [0.0, 1.0]
+/// fraction of fingerprint bits that flipped. `Json::Null` when neither
+/// side is a recognised image kind. Additive — no v1 schema bump.
+fn perceptual_diff_json(old: &[u8], new: &[u8]) -> crate::json::Json {
+    use crate::json::Json;
+    let old_fp = alt_diff::perceptual::fingerprint(old);
+    let new_fp = alt_diff::perceptual::fingerprint(new);
+    let Some(d) = alt_diff::perceptual::distance(old_fp, new_fp) else {
+        return Json::Null;
+    };
+    let prism = old_fp.unwrap().kind.as_str();
+    // Four decimal places — matches the chunk_diff ratio resolution.
+    let distance = (d * 10000.0).round() / 10000.0;
+    Json::Object(vec![
+        ("kind", Json::str("perceptual_diff")),
+        ("prism", Json::str(prism)),
+        ("distance", Json::Float(distance)),
+    ])
+}
+
+/// JSON shape for a part-aware diff:
+/// `{kind:"part_diff", prism, all_same, parts:[{name, status, old_bytes?,
+/// new_bytes?}]}`. `null` when neither side is a recognised kind so the
+/// caller falls back to the chunk_diff field above.
+fn part_aware_diff_json(old: &[u8], new: &[u8]) -> crate::json::Json {
+    use crate::json::Json;
+    let Some(s) = alt_diff::part_aware::summary(old, new) else {
+        return Json::Null;
+    };
+    let parts: Vec<Json> = s
+        .parts
+        .iter()
+        .map(|(name, change)| {
+            use alt_diff::part_aware::PartChange;
+            let (status, old_bytes, new_bytes) = match change {
+                PartChange::Same => ("same", Json::Null, Json::Null),
+                PartChange::Changed {
+                    old_bytes,
+                    new_bytes,
+                } => (
+                    "changed",
+                    Json::Num(*old_bytes as i64),
+                    Json::Num(*new_bytes as i64),
+                ),
+                PartChange::Added { new_bytes } => {
+                    ("added", Json::Null, Json::Num(*new_bytes as i64))
+                }
+                PartChange::Removed { old_bytes } => {
+                    ("removed", Json::Num(*old_bytes as i64), Json::Null)
+                }
+            };
+            Json::Object(vec![
+                ("name", Json::str(name)),
+                ("status", Json::str(status)),
+                ("old_bytes", old_bytes),
+                ("new_bytes", new_bytes),
+            ])
+        })
+        .collect();
+    Json::Object(vec![
+        ("kind", Json::str("part_diff")),
+        ("prism", Json::str(s.kind.as_str())),
+        ("all_same", Json::Bool(s.all_same())),
+        ("parts", Json::Array(parts)),
+    ])
+}
+
+/// JSON shape for a binary chunk diff:
+/// `{kind:"binary_chunk_diff", shared_chunks, added_chunks, removed_chunks,
+/// old_chunks, new_chunks, old_bytes, new_bytes, byte_shared_ratio}`. The
+/// `kind` discriminator leaves room for other diff kinds under the same
+/// `chunk_diff` field without a v1 schema bump.
+fn binary_chunk_diff_json(old: &[u8], new: &[u8]) -> crate::json::Json {
+    use crate::json::Json;
+    let cd = alt_diff::binary::chunk_diff(old, new, alt_diff::binary::DEFAULT_PARAMS);
+    // Round to four decimals — enough resolution for an agent's "is this
+    // mostly the same" check without surfacing FP-noise tails in stable
+    // schemas (the same `--full` mode that adds chunk OIDs can dial it up).
+    let ratio = (cd.byte_shared_ratio() * 10000.0).round() / 10000.0;
+    Json::Object(vec![
+        ("kind", Json::str("binary_chunk_diff")),
+        ("shared_chunks", Json::Num(cd.shared_chunks as i64)),
+        ("added_chunks", Json::Num(cd.added_chunks as i64)),
+        ("removed_chunks", Json::Num(cd.removed_chunks as i64)),
+        ("old_chunks", Json::Num(cd.old_chunks as i64)),
+        ("new_chunks", Json::Num(cd.new_chunks as i64)),
+        ("old_bytes", Json::Num(cd.old_bytes as i64)),
+        ("new_bytes", Json::Num(cd.new_bytes as i64)),
+        ("byte_shared_ratio", Json::Float(ratio)),
+    ])
+}
+
+/// Map a tracked path to the AST-diff language we have a parser for, or
+/// `None` for paths we don't (the caller falls back to line/binary diff).
+fn lang_for(path: &[u8]) -> Option<alt_treediff::Lang> {
+    let p = std::str::from_utf8(path).ok()?;
+    if p.ends_with(".rs") {
+        Some(alt_treediff::Lang::Rust)
+    } else {
+        None
+    }
+}
+
+/// JSON shape for an AST diff:
+/// `{kind:"ast_diff", logical_changes:[…], format_only_changes:[…],
+/// items_added:[…], items_removed:[…], is_format_only}`. Returns `Null` if
+/// the path has no parser, or if parsing failed on either side (the caller
+/// then falls through to the line-diff `hunks` field on the same entry,
+/// preserving signal — semantic resolution is a refinement, not a contract).
+fn ast_diff_json(path: &[u8], old: &[u8], new: &[u8]) -> crate::json::Json {
+    use crate::json::Json;
+    let Some(lang) = lang_for(path) else {
+        return Json::Null;
+    };
+    let (Ok(old_s), Ok(new_s)) = (std::str::from_utf8(old), std::str::from_utf8(new)) else {
+        return Json::Null;
+    };
+    let Ok(ast) = alt_treediff::tree_diff(old_s, new_s, lang) else {
+        return Json::Null;
+    };
+    let keys = |v: &[alt_treediff::ItemPresence]| {
+        Json::Array(v.iter().map(|p| Json::str(&p.key)).collect())
+    };
+    let changes =
+        |v: &[alt_treediff::ItemChange]| Json::Array(v.iter().map(|c| Json::str(&c.key)).collect());
+    Json::Object(vec![
+        ("kind", Json::str("ast_diff")),
+        ("logical_changes", changes(&ast.logical_changes)),
+        ("format_only_changes", changes(&ast.format_only_changes)),
+        ("items_added", keys(&ast.items_added)),
+        ("items_removed", keys(&ast.items_removed)),
+        ("is_format_only", Json::Bool(ast.is_format_only())),
+    ])
+}
+
+/// Human render for an AST diff: one section per kind, key per line.
+/// Silent (no output) for an empty diff so an unchanged file produces no
+/// stanza body — same shape as the line-diff path.
+fn write_ast_diff_summary(buf: &mut Vec<u8>, ast: &alt_treediff::AstDiff) {
+    let section = |buf: &mut Vec<u8>, label: &str, items: &[&str]| {
+        if items.is_empty() {
+            return;
+        }
+        buf.extend_from_slice(format!("{label}:\n").as_bytes());
+        for k in items {
+            buf.extend_from_slice(format!("  {k}\n").as_bytes());
+        }
+    };
+    let logical: Vec<&str> = ast.logical_changes.iter().map(|c| c.key.as_str()).collect();
+    let fmt_only: Vec<&str> = ast
+        .format_only_changes
+        .iter()
+        .map(|c| c.key.as_str())
+        .collect();
+    let added: Vec<&str> = ast.items_added.iter().map(|p| p.key.as_str()).collect();
+    let removed: Vec<&str> = ast.items_removed.iter().map(|p| p.key.as_str()).collect();
+    section(buf, "logical changes", &logical);
+    section(buf, "items added", &added);
+    section(buf, "items removed", &removed);
+    section(buf, "format-only", &fmt_only);
+}
+
+/// Try to parse `payload` as a ref-transaction. Wraps `alt_refs::parse_tx`
+/// so the caller doesn't import the parser; `None` means "this payload is
+/// not a ref tx" (import, future op kinds), not an error.
+fn parse_ref_tx_or_none(payload: &[u8]) -> Res<Option<alt_refs::ParsedTx>> {
+    Ok(alt_refs::parse_tx(payload)?)
+}
+
+fn render_target(t: &Option<RefTarget>) -> String {
+    match t {
+        None => "null".to_string(),
+        Some(RefTarget::Oid(oid)) => oid.to_string(),
+        Some(RefTarget::Symbolic(name)) => format!("@{name}"),
+    }
+}
+
+/// JSON shape for a structured principal: `{kind: "human"|"agent", id, session}`
+/// (session is `null` when unset). Re-used wherever an actor is surfaced
+/// — `status --json` and `op-log --json`.
+fn principal_json(p: &Principal) -> crate::json::Json {
+    use crate::json::Json;
+    let kind = match p.kind {
+        PrincipalKind::Human => "human",
+        PrincipalKind::Agent => "agent",
+    };
+    Json::Object(vec![
+        ("kind", Json::str(kind)),
+        ("id", Json::str(&p.id)),
+        (
+            "session",
+            match &p.session {
+                Some(s) => Json::str(s),
+                None => Json::Null,
+            },
+        ),
+    ])
+}
+
+/// One diff hunk as JSON: the `@@` coordinates plus tagged lines, where each
+/// line is `{tag: context|add|remove, content}` (content keeps its raw bytes,
+/// including any trailing newline).
+fn hunk_json(h: &alt_diff::Hunk) -> crate::json::Json {
+    use crate::json::Json;
+    let lines = h
+        .lines
+        .iter()
+        .map(|(tag, line)| {
+            let kind = match tag {
+                b'+' => "add",
+                b'-' => "remove",
+                _ => "context",
+            };
+            Json::Object(vec![("tag", Json::str(kind)), ("content", Json::str(line))])
+        })
+        .collect();
+    Json::Object(vec![
+        ("old_start", Json::Num(h.old_start as i64)),
+        ("old_len", Json::Num(h.old_len as i64)),
+        ("new_start", Json::Num(h.new_start as i64)),
+        ("new_len", Json::Num(h.new_len as i64)),
+        ("lines", Json::Array(lines)),
+    ])
+}
+
+/// How a merge resolves once computed (no refs or work tree touched yet).
+enum MergeOutcome {
+    /// `theirs` is already an ancestor of `ours`; nothing to do.
+    UpToDate,
+    /// `ours` is an ancestor of `theirs`; advance to this commit.
+    FastForward(ObjectId),
+    /// A clean three-way merge: this merge commit and its flattened tree.
+    Merged {
+        commit: ObjectId,
+        entries: Vec<WorkEntry>,
+    },
+    /// At least one path conflicts; the per-path resolutions to write out.
+    Conflicted(Vec<Resolved>),
+}
+
+/// A zero-stat index entry at a given merge `stage` (1=base, 2=ours,
+/// 3=theirs).
+fn stage_entry(w: &WorkEntry, stage: u8) -> IndexEntry {
+    IndexEntry {
+        ctime: (0, 0),
+        mtime: (0, 0),
+        dev: 0,
+        ino: 0,
+        mode: w.mode,
+        uid: 0,
+        gid: 0,
+        size: 0,
+        oid: w.oid,
+        flags: ((stage as u16) << 12) | (w.path.len().min(0x0FFF) as u16),
+        extended_flags: None,
+        path: w.path.clone(),
+    }
+}
+
+#[cfg(unix)]
+fn symlink_to(target: &[u8], at: &Path) -> Res<()> {
+    use std::os::unix::ffi::OsStrExt;
+    std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(target), at)?;
+    if let Some(parent) = at.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn symlink_to(target: &[u8], at: &Path) -> Res<()> {
+    // no symlink support: fall back to a regular file holding the target text
+    crate::durable::write(at, target)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_exec(path: &Path, exec: bool) -> Res<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let perm = if exec { 0o755 } else { 0o644 };
+    crate::durable::set_permissions(path, std::fs::Permissions::from_mode(perm))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_exec(_path: &Path, _exec: bool) -> Res<()> {
+    Ok(())
+}
+
+/// Minimal git check-ref-format: no empty/space/control chars, no `..`,
+/// no leading/trailing slash, no segment starting with a dot.
+/// Validate `<name>` is acceptable as a `refs/tags/<name>` path. Same
+/// rules as branch names — git rejects `..`, leading `/`, embedded
+/// control bytes, and a few special chars; we delegate to the branch
+/// validator since the constraints overlap exactly.
+fn check_tag_name(name: &str) -> Res<()> {
+    check_branch_name(name)
+}
+
+/// Build the canonical git-object bytes for an annotated tag. The
+/// hashing wrapper (`<size>\0<bytes>`) is applied separately by
+/// `ObjectId::hash_object`.
+#[allow(clippy::too_many_arguments)]
+fn build_tag_bytes(
+    object: ObjectId,
+    obj_type: &str,
+    tag_name: &str,
+    tagger_name: &str,
+    tagger_email: &str,
+    when: i64,
+    tz: &str,
+    message: &str,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(format!("object {object}\n").as_bytes());
+    bytes.extend_from_slice(format!("type {obj_type}\n").as_bytes());
+    bytes.extend_from_slice(format!("tag {tag_name}\n").as_bytes());
+    bytes.extend_from_slice(
+        format!("tagger {tagger_name} <{tagger_email}> {when} {tz}\n").as_bytes(),
+    );
+    bytes.push(b'\n');
+    bytes.extend_from_slice(message.as_bytes());
+    bytes
+}
+
+fn check_branch_name(name: &str) -> Res<()> {
+    let bad = name.is_empty()
+        || name.starts_with('/')
+        || name.ends_with('/')
+        || name.ends_with(".lock")
+        || name.contains("..")
+        || name.contains("//")
+        || name.contains(['\\', ' ', '~', '^', ':', '?', '*', '['])
+        || name.bytes().any(|b| b < 0x20 || b == 0x7f)
+        || name
+            .split('/')
+            .any(|seg| seg.is_empty() || seg.starts_with('.'));
+    if bad {
+        return Err(format!("'{name}' is not a valid branch name").into());
+    }
+    Ok(())
+}
+
+/// One configured git remote (parsed from `<alt-dir>/remotes/<name>`).
+struct Remote {
+    name: String,
+    url: String,
+    fetch: String,
+}
+
+/// One server-ref → local-ref mapping that the fetch will write.
+struct RefUpdate {
+    /// The ref name on the remote (e.g. `refs/heads/main`).
+    server_name: String,
+    /// The destination ref locally (e.g. `refs/remotes/origin/main`).
+    local_name: String,
+    /// New oid from the remote.
+    new: ObjectId,
+    /// Currently-tracked oid, or `None` if this ref is new locally.
+    old: Option<ObjectId>,
+}
+
+/// A parsed refspec: `[+]<src>:<dst>` with optional `*` wildcard segments.
+/// Only the wildcard form `<prefix>*<suffix>:<prefix>*<suffix>` and exact
+/// forms are supported — enough for the canonical default
+/// `+refs/heads/*:refs/remotes/<name>/*` plus user-provided exact pairs.
+struct RefSpec {
+    /// `+` allows non-fast-forward (mirrored from git; the local
+    /// `commit_refs` force gate still applies for branches the policy
+    /// covers).
+    #[allow(dead_code)]
+    force: bool,
+    src_prefix: String,
+    src_suffix: String,
+    dst_prefix: String,
+    dst_suffix: String,
+    /// `true` iff this is a wildcard refspec (`*` appears in both sides).
+    wildcard: bool,
+}
+
+impl RefSpec {
+    fn parse(s: &str) -> Res<Self> {
+        let (force, rest) = match s.strip_prefix('+') {
+            Some(r) => (true, r),
+            None => (false, s),
+        };
+        let (src, dst) = rest
+            .split_once(':')
+            .ok_or_else(|| format!("malformed refspec '{s}': missing ':'"))?;
+        let src_star = src.find('*');
+        let dst_star = dst.find('*');
+        match (src_star, dst_star) {
+            (Some(si), Some(di)) => Ok(RefSpec {
+                force,
+                src_prefix: src[..si].to_owned(),
+                src_suffix: src[si + 1..].to_owned(),
+                dst_prefix: dst[..di].to_owned(),
+                dst_suffix: dst[di + 1..].to_owned(),
+                wildcard: true,
+            }),
+            (None, None) => Ok(RefSpec {
+                force,
+                src_prefix: src.to_owned(),
+                src_suffix: String::new(),
+                dst_prefix: dst.to_owned(),
+                dst_suffix: String::new(),
+                wildcard: false,
+            }),
+            _ => Err(format!("malformed refspec '{s}': wildcard must be on both sides").into()),
+        }
+    }
+
+    /// Map a server ref name to its local destination, or `None` if the
+    /// ref doesn't match this spec.
+    fn map(&self, server_ref: &str) -> Option<String> {
+        if !self.wildcard {
+            if server_ref == self.src_prefix {
+                return Some(self.dst_prefix.clone());
+            }
+            return None;
+        }
+        let mid = server_ref
+            .strip_prefix(&self.src_prefix)?
+            .strip_suffix(&self.src_suffix)?;
+        Some(format!("{}{}{}", self.dst_prefix, mid, self.dst_suffix))
+    }
+}
+
+/// A single `<src>[:<dst>]` push spec, optionally prefixed with `+` (or
+/// pushed under `-f`) to allow a non-fast-forward server-side update.
+/// Wildcards aren't supported yet — explicit refspecs only.
+struct PushSpec {
+    src: String,
+    dst: String,
+    #[allow(dead_code)]
+    force: bool,
+}
+
+impl PushSpec {
+    fn parse(s: &str, force_flag: bool) -> Res<Self> {
+        let (force, rest) = match s.strip_prefix('+') {
+            Some(r) => (true, r),
+            None => (false, s),
+        };
+        let (src, dst) = match rest.split_once(':') {
+            Some((s, d)) => (s, d),
+            None => (rest, rest),
+        };
+        if src.is_empty() || dst.is_empty() {
+            return Err(format!("malformed push refspec '{s}'").into());
+        }
+        Ok(PushSpec {
+            src: src.to_owned(),
+            dst: dst.to_owned(),
+            force: force || force_flag,
+        })
+    }
+}
+
+/// Expand a short ref name to its full local form: `main` →
+/// `refs/heads/main`. Already-qualified names pass through.
+fn canonicalise_local_ref(name: &str) -> String {
+    if name.starts_with("refs/") || name == "HEAD" {
+        name.to_owned()
+    } else {
+        format!("refs/heads/{name}")
+    }
+}
+
+/// Same DWIM but for the destination side: a remote `<branch>` becomes
+/// `refs/heads/<branch>` (push never targets `refs/remotes/...`).
+fn canonicalise_remote_ref(name: &str) -> String {
+    if name.starts_with("refs/") {
+        name.to_owned()
+    } else {
+        format!("refs/heads/{name}")
+    }
+}
+
+/// Map the server-advertised `object-format=<algo>` to a [`HashAlgo`].
+/// Default (server didn't advertise) is sha-1, matching git.
+fn parse_object_format(advertised: Option<&str>) -> Res<HashAlgo> {
+    match advertised {
+        None | Some("sha1") => Ok(HashAlgo::Sha1),
+        Some("sha256") => Ok(HashAlgo::Sha256),
+        Some(other) => Err(format!("unsupported object-format '{other}'").into()),
+    }
+}
+
+/// Op-level signing policy, read from `<alt-dir>/sign-policy`. The
+/// file is a tiny `key=value` text shape (same convention as remotes /
+/// policy elsewhere in alt):
+///
+/// ```text
+/// enabled = true
+/// principal = alice           # optional; defaults to the caller's id
+/// ```
+///
+/// Missing file = signing disabled. `enabled` is the only required key;
+/// `principal` lets a repo pin signing to a fixed identity even when
+/// multiple agents share the working tree.
+struct SignPolicy {
+    enabled: bool,
+    principal: Option<String>,
+}
+
+impl SignPolicy {
+    fn load(alt_dir: &Path) -> Res<Self> {
+        let path = alt_dir.join("sign-policy");
+        let body = match std::fs::read_to_string(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(SignPolicy {
+                    enabled: false,
+                    principal: None,
+                });
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let mut enabled = false;
+        let mut principal = None;
+        for line in body.lines() {
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
+            match k.trim() {
+                "enabled" => enabled = v.trim() == "true",
+                "principal" => principal = Some(v.trim().to_owned()),
+                _ => {} // forward-compat
+            }
+        }
+        Ok(SignPolicy { enabled, principal })
+    }
+}
+
+/// One parsed signature row from `<alt-dir>/oplog/sigs.log`. Each row is
+/// `<op-id-hex> <principal> alt-sig-ed25519:<base64url>\n`.
+#[derive(Debug, Clone)]
+struct SigRow {
+    op_id: OpId,
+    principal: String,
+    sig: alt_sign::Sig,
+}
+
+fn read_sig_rows(alt_dir: &Path) -> Res<Vec<SigRow>> {
+    let path = alt_dir.join("oplog").join("sigs.log");
+    let body = match std::fs::read_to_string(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut rows = Vec::new();
+    for line in body.lines() {
+        let mut parts = line.splitn(3, ' ');
+        let Some(op_hex) = parts.next() else { continue };
+        let Some(principal) = parts.next() else {
+            continue;
+        };
+        let Some(sig_text) = parts.next() else {
+            continue;
+        };
+        let mut op_bytes = [0u8; 32];
+        if op_hex.len() != 64 {
+            continue;
+        }
+        let mut ok = true;
+        for (i, b) in op_bytes.iter_mut().enumerate() {
+            let hi = nibble(op_hex.as_bytes()[i * 2]);
+            let lo = nibble(op_hex.as_bytes()[i * 2 + 1]);
+            match (hi, lo) {
+                (Some(h), Some(l)) => *b = (h << 4) | l,
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let Ok(sig) = alt_sign::Sig::from_text(sig_text) else {
+            continue;
+        };
+        rows.push(SigRow {
+            op_id: OpId(op_bytes),
+            principal: principal.to_owned(),
+            sig,
+        });
+    }
+    Ok(rows)
+}
+
+fn nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// The verdict shape used by `alt verify` for one commit. The
+/// taxonomy mirrors [`SigVerdict`] used by `op-log --verify` so an
+/// auditor sees the same vocabulary across the two surfaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CommitSigVerdict {
+    Ok {
+        principal: String,
+    },
+    Unsigned,
+    Bad {
+        principal: String,
+    },
+    Untrusted {
+        principal: String,
+    },
+    /// The supplied oid resolves to a non-commit object — caller bug.
+    NotACommit,
+    /// The supplied oid doesn't resolve in the repo's odb at all.
+    Missing,
+}
+
+impl CommitSigVerdict {
+    fn tag(&self) -> &'static str {
+        match self {
+            Self::Ok { .. } => "signed-ok",
+            Self::Unsigned => "unsigned",
+            Self::Bad { .. } => "bad-sig",
+            Self::Untrusted { .. } => "untrusted",
+            Self::NotACommit => "not-a-commit",
+            Self::Missing => "missing",
+        }
+    }
+
+    fn principal(&self) -> Option<&str> {
+        match self {
+            Self::Ok { principal } | Self::Bad { principal } | Self::Untrusted { principal } => {
+                Some(principal.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    fn render(&self) -> String {
+        match self {
+            Self::Ok { principal } => format!("signed-ok:{principal}"),
+            Self::Unsigned => "unsigned".to_owned(),
+            Self::Bad { principal } => format!("bad-sig:{principal}"),
+            Self::Untrusted { principal } => format!("untrusted:{principal}"),
+            Self::NotACommit => "not-a-commit".to_owned(),
+            Self::Missing => "missing".to_owned(),
+        }
+    }
+}
+
+/// Parse `bytes` (a commit object) for its `alt-sig` header, look the
+/// principal up in `trust`, and decide one of the four sig verdicts. A
+/// commit with no `alt-sig` is `Unsigned`. A commit with a malformed
+/// `alt-sig` is `Bad` (no principal to attribute the failure to, so we
+/// surface an empty-string principal).
+fn verdict_for_commit(bytes: &[u8], trust: &[(String, alt_sign::PublicKey)]) -> CommitSigVerdict {
+    match crate::commit_sign::extract_alt_sig(bytes) {
+        Ok(None) => CommitSigVerdict::Unsigned,
+        Ok(Some(parsed)) => match trust.iter().find(|(id, _)| id == &parsed.principal) {
+            None => CommitSigVerdict::Untrusted {
+                principal: parsed.principal,
+            },
+            Some((_, key)) => match key.verify(&parsed.canonical, &parsed.sig) {
+                Ok(()) => CommitSigVerdict::Ok {
+                    principal: parsed.principal,
+                },
+                Err(_) => CommitSigVerdict::Bad {
+                    principal: parsed.principal,
+                },
+            },
+        },
+        Err(_) => CommitSigVerdict::Bad {
+            principal: String::new(),
+        },
+    }
+}
+
+/// The four possible outcomes of `alt op-log --verify` for one op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SigVerdict {
+    /// Signature matched a trusted principal — auditor can rely on this op.
+    Ok { principal: String },
+    /// No signature row exists for this op (signing was off when the op
+    /// was written, or a different principal performed it).
+    Unsigned,
+    /// Signature row exists but Ed25519 verification failed against the
+    /// claimed principal's pubkey — tampering, key swap, or corruption.
+    Bad { principal: String },
+    /// Signature row exists and parses, but no matching pubkey lives in
+    /// `<alt-dir>/trust/<principal>.pub` — auditor can't decide.
+    Untrusted { principal: String },
+}
+
+/// Walk the sig sidecar + trust store; for each requested op id, decide
+/// which [`SigVerdict`] applies. Stops short of fetching pubkeys lazily —
+/// for an op-log of a few hundred entries, loading all trust pubkeys
+/// up-front is cheaper than `O(N×M)` re-reads.
+fn verify_oplog_signatures(
+    alt_dir: &Path,
+    entries: &[&alt_oplog::Op],
+) -> Res<std::collections::HashMap<OpId, SigVerdict>> {
+    let rows = read_sig_rows(alt_dir)?;
+    let trust = read_pubkey_dir(&alt_dir.join("trust"))?;
+    let trust_map: std::collections::BTreeMap<String, alt_sign::PublicKey> =
+        trust.into_iter().collect();
+    let by_id: std::collections::HashMap<OpId, &SigRow> =
+        rows.iter().map(|r| (r.op_id, r)).collect();
+
+    let mut out = std::collections::HashMap::new();
+    for op in entries {
+        let verdict = match by_id.get(&op.id) {
+            None => SigVerdict::Unsigned,
+            Some(row) => match trust_map.get(&row.principal) {
+                None => SigVerdict::Untrusted {
+                    principal: row.principal.clone(),
+                },
+                Some(pubkey) => match pubkey.verify(&op.id.0, &row.sig) {
+                    Ok(()) => SigVerdict::Ok {
+                        principal: row.principal.clone(),
+                    },
+                    Err(_) => SigVerdict::Bad {
+                        principal: row.principal.clone(),
+                    },
+                },
+            },
+        };
+        out.insert(op.id, verdict);
+    }
+    Ok(out)
+}
+
+/// A principal id is the same shape as a remote name: a single path
+/// segment with no separators or special chars (it becomes part of a
+/// file name under `<alt-dir>/identity/<id>.pub`).
+fn check_principal_id(name: &str) -> Res<()> {
+    let bad = name.is_empty()
+        || name.starts_with('.')
+        || name.contains('/')
+        || name.contains(['\\', ' ', '~', '^', ':', '?', '*', '[', '.'])
+        || name.bytes().any(|b| b < 0x20 || b == 0x7f);
+    if bad {
+        return Err(format!("'{name}' is not a valid principal id").into());
+    }
+    Ok(())
+}
+
+/// Write a secret-bearing file with restrictive permissions (0600 on
+/// Unix; default on other platforms — alt's primary targets are
+/// macOS/Linux). Uses an atomic temp+rename so a crashed write doesn't
+/// leave a half-written secret in place.
+fn write_secret_file(path: &Path, body: &[u8]) -> Res<()> {
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        f.write_all(body)?;
+        f.sync_all()?;
+    }
+    set_secret_perms(&tmp)?;
+    crate::durable::rename(&tmp, path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_secret_perms(path: &Path) -> Res<()> {
+    use std::os::unix::fs::PermissionsExt;
+    crate::durable::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_secret_perms(_path: &Path) -> Res<()> {
+    Ok(())
+}
+
+/// Scan a directory for `*.pub` files, parse each as an
+/// `alt-pubkey-ed25519:` key. Files that don't parse are silently
+/// skipped — they may be stray files; loud parsing happens at `trust`
+/// time, not at `list` time.
+fn read_pubkey_dir(dir: &Path) -> Res<Vec<(String, alt_sign::PublicKey)>> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("pub") {
+            continue;
+        }
+        let name = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(n) => n.to_owned(),
+            None => continue,
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Ok(key) = alt_sign::PublicKey::from_text(&text) {
+            out.push((name, key));
+        }
+    }
+    Ok(out)
+}
+
+/// First 16 hex chars of the raw 32-byte public key — short enough to
+/// fit a list row, unique enough in practice for human identification.
+fn fingerprint(key: &alt_sign::PublicKey) -> String {
+    let bytes = key.as_bytes();
+    let mut out = String::with_capacity(16);
+    for b in &bytes[..8] {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// A remote name: a single path segment (it becomes a file name). Same
+/// shape rules as a workspace name, minus the workspace-specific reserved
+/// default — so `origin`, `upstream`, `my-fork` are fine.
+fn check_remote_name(name: &str) -> Res<()> {
+    let bad = name.is_empty()
+        || name.starts_with('.')
+        || name.contains('/')
+        || name.contains(['\\', ' ', '~', '^', ':', '?', '*', '[', '.'])
+        || name.bytes().any(|b| b < 0x20 || b == 0x7f);
+    if bad {
+        return Err(format!("'{name}' is not a valid remote name").into());
+    }
+    Ok(())
+}
+
+/// The default fetch refspec for a new remote: every branch on the
+/// remote lands under `refs/remotes/<name>/*` locally. The `+` marker
+/// allows non-fast-forward updates of the remote-tracking ref (matching
+/// git's default behavior).
+fn default_fetch_refspec(name: &str) -> String {
+    format!("+refs/heads/*:refs/remotes/{name}/*")
+}
+
+/// A 7-hex-char object id abbreviation, or all-zero for an absent side.
+fn abbrev(oid: Option<ObjectId>) -> String {
+    match oid {
+        Some(o) => o.to_string()[..7].to_owned(),
+        None => "0000000".to_owned(),
+    }
+}
+
+fn empty_index() -> Index {
+    Index {
+        version: 2,
+        entries: Vec::new(),
+        extensions: Vec::new(),
+    }
+}
+
+/// Atomic index write to `path`: temp file + rename (sibling temp).
+///
+/// Racily clean entries are handled as git does: an entry whose mtime is not
+/// older than the index file itself may be rewritten within the same clock
+/// tick (coarse on Linux) with the same size, which a stat compare cannot
+/// see. Those entries get a zero mtime, so the next scan re-hashes them.
+fn save_index(path: &Path, index: &Index, algo: HashAlgo) -> Res<()> {
+    let tmp = path.with_extension("tmp");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::durable::write(&tmp, index.serialize(algo))?;
+    let stamp = file_mtime(&std::fs::metadata(&tmp)?);
+    if index.entries.iter().any(|e| e.mtime >= stamp) {
+        let mut smudged = index.clone();
+        for e in smudged.entries.iter_mut().filter(|e| e.mtime >= stamp) {
+            e.mtime = (0, 0);
+        }
+        crate::durable::write(&tmp, smudged.serialize(algo))?;
+    }
+    crate::durable::rename(&tmp, path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_mtime(meta: &std::fs::Metadata) -> (u32, u32) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.mtime() as u32, meta.mtime_nsec() as u32)
+}
+
+// stat is never trusted off unix, so no entry is ever racily clean
+#[cfg(not(unix))]
+fn file_mtime(_meta: &std::fs::Metadata) -> (u32, u32) {
+    (u32::MAX, u32::MAX)
+}
+
+/// Builds an index entry for a working-tree file, filling stat from its
+/// metadata so git reads our index without spurious "modified".
+#[cfg(unix)]
+fn stat_entry(meta: &std::fs::Metadata, w: &WorkEntry) -> IndexEntry {
+    use std::os::unix::fs::MetadataExt;
+    IndexEntry {
+        ctime: (meta.ctime() as u32, meta.ctime_nsec() as u32),
+        mtime: (meta.mtime() as u32, meta.mtime_nsec() as u32),
+        dev: meta.dev() as u32,
+        ino: meta.ino() as u32,
+        mode: w.mode,
+        uid: meta.uid(),
+        gid: meta.gid(),
+        size: meta.size() as u32,
+        oid: w.oid,
+        flags: (w.path.len().min(0x0FFF)) as u16,
+        extended_flags: None,
+        path: w.path.clone(),
+    }
+}
+
+#[cfg(not(unix))]
+fn stat_entry(_meta: &std::fs::Metadata, w: &WorkEntry) -> IndexEntry {
+    IndexEntry {
+        ctime: (0, 0),
+        mtime: (0, 0),
+        dev: 0,
+        ino: 0,
+        mode: w.mode,
+        uid: 0,
+        gid: 0,
+        size: 0,
+        oid: w.oid,
+        flags: (w.path.len().min(0x0FFF)) as u16,
+        extended_flags: None,
+        path: w.path.clone(),
+    }
+}
+
+/// Zero-stat index entry for a gitlink (mode 160000). Git emits the same
+/// shape: there is no on-disk file to stat, only the recorded submodule
+/// commit oid. Keeps the index byte-comparable across alt and git.
+fn gitlink_entry(w: &WorkEntry) -> IndexEntry {
+    IndexEntry {
+        ctime: (0, 0),
+        mtime: (0, 0),
+        dev: 0,
+        ino: 0,
+        mode: w.mode,
+        uid: 0,
+        gid: 0,
+        size: 0,
+        oid: w.oid,
+        flags: (w.path.len().min(0x0FFF)) as u16,
+        extended_flags: None,
+        path: w.path.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn store_durability_barrier_waits_for_object_batch() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        init(Some(dir.path().to_owned()), &mut Vec::new()).unwrap();
+        let mut store = Store::open(dir.path().join(".alt")).unwrap();
+        store.set_defer_durability(true);
+        store.odb.flush_pending().unwrap();
+        assert_eq!(store.write_epoch(), 0, "idle cleanup is not a write");
+        let sink = store.sink().unwrap();
+        let data = b"object in an unfinished deferred batch";
+        let oid = ObjectId::hash_object(HashAlgo::Sha1, ObjectKind::Blob, data);
+        store.odb.put(oid, ObjectKind::Blob, data).unwrap();
+        // A command can fail after writing part of its object batch.
+        let bad_oid = ObjectId::hash_object(HashAlgo::Sha1, ObjectKind::Blob, b"declared");
+        assert!(
+            store
+                .odb
+                .put(bad_oid, ObjectKind::Blob, b"wrong identity")
+                .is_err()
+        );
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            sink.fsync_all().unwrap();
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        store.odb.flush_pending().unwrap();
+        done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        worker.join().unwrap();
+        drop(store);
+        let reopened = Store::open(dir.path().join(".alt")).unwrap();
+        assert_eq!(reopened.odb.get(&oid).unwrap().unwrap().data, data);
+    }
+
+    /// Opens an owning handle on `root`'s default (or named) workspace.
+    fn open(root: &Path, ws: Option<&str>) -> OpenRepo {
+        OpenRepo::discover(root, ws, Identity::from_env()).unwrap()
+    }
+
+    /// The canonical wildcard refspec maps `refs/heads/<X>` →
+    /// `refs/remotes/<remote>/<X>` for any branch name `<X>`.
+    #[test]
+    fn refspec_wildcard_maps_heads_to_remote_tracking() {
+        let spec = RefSpec::parse("+refs/heads/*:refs/remotes/origin/*").unwrap();
+        assert!(spec.wildcard);
+        assert_eq!(
+            spec.map("refs/heads/main").as_deref(),
+            Some("refs/remotes/origin/main")
+        );
+        assert_eq!(
+            spec.map("refs/heads/feature/x").as_deref(),
+            Some("refs/remotes/origin/feature/x")
+        );
+        // out of scope: tags don't match a heads-only spec
+        assert_eq!(spec.map("refs/tags/v1"), None);
+        // out of scope: a ref that doesn't share the prefix
+        assert_eq!(spec.map("HEAD"), None);
+    }
+
+    /// An exact (non-wildcard) refspec maps exactly one ref name; anything
+    /// else returns `None`.
+    #[test]
+    fn refspec_exact_match_is_one_to_one() {
+        let spec = RefSpec::parse("refs/heads/main:refs/remotes/origin/main").unwrap();
+        assert!(!spec.wildcard);
+        assert_eq!(
+            spec.map("refs/heads/main").as_deref(),
+            Some("refs/remotes/origin/main")
+        );
+        assert_eq!(spec.map("refs/heads/dev"), None);
+    }
+
+    /// A malformed refspec (missing `:` or one-sided wildcard) is a typed
+    /// error, not a silent miss.
+    #[test]
+    fn refspec_malformed_input_is_rejected() {
+        assert!(RefSpec::parse("refs/heads/main").is_err());
+        assert!(RefSpec::parse("refs/heads/*:refs/remotes/origin/main").is_err());
+        assert!(RefSpec::parse("refs/heads/main:refs/remotes/origin/*").is_err());
+    }
+
+    /// `alt clone` derives the target directory from the URL's last path
+    /// segment, mirroring git's behaviour: strip `.git`, strip trailing
+    /// slashes. Empty / unusable URLs → `None` (caller errors out).
+    #[test]
+    fn derive_clone_dir_strips_git_suffix_and_slashes() {
+        assert_eq!(
+            derive_clone_dir("https://github.com/user/repo.git").as_deref(),
+            Some("repo")
+        );
+        assert_eq!(
+            derive_clone_dir("https://github.com/user/repo.git/").as_deref(),
+            Some("repo")
+        );
+        assert_eq!(
+            derive_clone_dir("https://example.com/myproj").as_deref(),
+            Some("myproj")
+        );
+        // ssh-like form: the part after the last `/`
+        assert_eq!(
+            derive_clone_dir("git@github.com:user/repo.git").as_deref(),
+            Some("repo")
+        );
+        // empty URL has no segment to derive from
+        assert_eq!(derive_clone_dir(""), None);
+    }
+
+    /// A named workspace gets its own HEAD, index, and working tree, while the
+    /// odb and branch refs stay shared — so work in one does not disturb the
+    /// other.
+    #[test]
+    fn workspaces_isolate_head_index_and_working_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut sink = Vec::new();
+
+        // default workspace: first commit on main, then a `feat` branch
+        init(Some(root.to_path_buf()), &mut sink).unwrap();
+        std::fs::write(root.join("a.txt"), "main\n").unwrap();
+        let mut o = open(root, None);
+        let mut repo = o.repo();
+        repo.add(&[".".to_owned()], false, &mut sink).unwrap();
+        repo.commit("first", Default::default(), false, &mut sink)
+            .unwrap();
+        repo.branch(Some("feat".to_owned()), None, false, false, &mut sink)
+            .unwrap();
+
+        // a second workspace on `feat`, in its own working tree outside the repo
+        let wt_tmp = tempfile::tempdir().unwrap();
+        let wt = wt_tmp.path().join("ws2-tree");
+        repo.create_workspace("ws2", &wt, "feat").unwrap();
+        drop(repo); // end the mutating command view before opening another
+        assert_eq!(
+            std::fs::read_to_string(wt.join("a.txt")).unwrap(),
+            "main\n",
+            "new workspace materializes its branch tree"
+        );
+
+        // commit in ws2 (advancing feat) — the default workspace is untouched
+        std::fs::write(wt.join("a.txt"), "feat-work\n").unwrap();
+        let mut o2 = open(root, Some("ws2"));
+        let mut ws2 = o2.repo();
+        ws2.add(&[".".to_owned()], false, &mut sink).unwrap();
+        ws2.commit("ws2 work", Default::default(), false, &mut sink)
+            .unwrap();
+        drop(ws2);
+
+        // default workspace: still on main, working tree and HEAD unchanged
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "main\n"
+        );
+        let mut od = open(root, None);
+        let def = od.repo();
+        assert_eq!(def.head_branch().unwrap(), "refs/heads/main");
+        assert_eq!(
+            open(root, Some("ws2")).repo().head_branch().unwrap(),
+            "refs/heads/feat",
+            "ws2 is on feat"
+        );
+
+        // shared store: the default workspace sees feat advanced by ws2
+        assert!(def.store.refs.resolve("refs/heads/feat").unwrap().is_some());
+
+        // listing shows both; removing ws2 drops it
+        let names: Vec<String> = def
+            .list_workspaces()
+            .unwrap()
+            .into_iter()
+            .map(|(n, ..)| n)
+            .collect();
+        assert!(names.contains(&"default".to_owned()));
+        assert!(names.contains(&"ws2".to_owned()));
+        open(root, None).repo().remove_workspace("ws2").unwrap();
+        assert!(OpenRepo::discover(root, Some("ws2"), Identity::from_env()).is_err());
+    }
+
+    #[test]
+    fn the_default_workspace_cannot_be_removed_and_bad_names_are_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut sink = Vec::new();
+        init(Some(root.to_path_buf()), &mut sink).unwrap();
+        std::fs::write(root.join("a.txt"), "x\n").unwrap();
+        let mut o = open(root, None);
+        let mut repo = o.repo();
+        repo.add(&[".".to_owned()], false, &mut sink).unwrap();
+        repo.commit("c", Default::default(), false, &mut sink)
+            .unwrap();
+
+        assert!(repo.remove_workspace("default").is_err());
+        let wt = root.join("bad");
+        assert!(repo.create_workspace("with/slash", &wt, "main").is_err());
+        assert!(repo.create_workspace("default", &wt, "main").is_err());
+        assert!(repo.create_workspace("ok", &wt, "no-such-branch").is_err());
+    }
+
+    /// `actor_string` and `parse_actor` are mutual inverses for the structured
+    /// form — same principal+verb survive an encode/decode round-trip,
+    /// including the optional `session` correlator.
+    #[test]
+    fn principal_actor_roundtrip() {
+        for case in [
+            Principal {
+                kind: PrincipalKind::Agent,
+                id: "bot-1".into(),
+                session: Some("01J7XYZ".into()),
+            },
+            Principal {
+                kind: PrincipalKind::Human,
+                id: "alice".into(),
+                session: None,
+            },
+        ] {
+            for verb in ["commit", "flow", "switch"] {
+                let s = case.actor_string("doracawl", verb);
+                let (decoded, dverb) = Principal::parse_actor(&s);
+                assert_eq!(decoded, case, "round-trip principal mismatch ({s})");
+                assert_eq!(dverb, verb, "round-trip verb mismatch ({s})");
+            }
+        }
+    }
+
+    /// Op-log entries written by older alt use `cli/<verb>@<user>` (the
+    /// pre-structured form). They must still parse as a Human principal with
+    /// `id == user`, so importing/reading older repositories is lossless.
+    #[test]
+    fn principal_actor_legacy_compat() {
+        let (p, verb) = Principal::parse_actor("cli/commit@alice");
+        assert_eq!(p.kind, PrincipalKind::Human);
+        assert_eq!(p.id, "alice");
+        assert_eq!(p.session, None);
+        assert_eq!(verb, "commit");
+
+        let (p, verb) = Principal::parse_actor("cli/flow@bob");
+        assert_eq!(p.kind, PrincipalKind::Human);
+        assert_eq!(p.id, "bob");
+        assert_eq!(verb, "flow");
+    }
+
+    /// `Identity::from_lookup` reads the principal env vars when present and
+    /// degrades to a Human principal anchored on `USER` when they are not —
+    /// so callers that don't set them see exactly the old behaviour (defaults preserved).
+    #[test]
+    fn identity_reads_alt_principal_env_with_defaults() {
+        let id = Identity::from_lookup(|k| match k {
+            "USER" => Some("alice".into()),
+            _ => None,
+        });
+        assert_eq!(id.principal.kind, PrincipalKind::Human);
+        assert_eq!(id.principal.id, "alice");
+        assert_eq!(id.principal.session, None);
+        assert_eq!(id.actor("commit"), "human:alice;user:alice;verb:commit");
+
+        let id = Identity::from_lookup(|k| match k {
+            "USER" => Some("alice".into()),
+            "ALT_PRINCIPAL_KIND" => Some("agent".into()),
+            "ALT_PRINCIPAL_ID" => Some("bot-1".into()),
+            "ALT_SESSION_ID" => Some("01J7".into()),
+            _ => None,
+        });
+        assert_eq!(id.principal.kind, PrincipalKind::Agent);
+        assert_eq!(id.principal.id, "bot-1");
+        assert_eq!(id.principal.session.as_deref(), Some("01J7"));
+        let (p, verb) = Principal::parse_actor(&id.actor("commit"));
+        assert_eq!(p, id.principal, "actor round-trips back to principal");
+        assert_eq!(verb, "commit");
+
+        // Unknown kind value falls back to Human (defensive: env mis-set
+        // should not invent an Agent identity the caller did not declare).
+        let id = Identity::from_lookup(|k| match k {
+            "USER" => Some("alice".into()),
+            "ALT_PRINCIPAL_KIND" => Some("robot".into()),
+            _ => None,
+        });
+        assert_eq!(id.principal.kind, PrincipalKind::Human);
+    }
+}

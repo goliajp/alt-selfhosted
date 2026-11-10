@@ -1,0 +1,208 @@
+//! `alt show <rev>`: a thin wrapper over `alt log -p -n 1 --pretty=raw`
+//! that gives users the "show this one commit + its patch" verb every
+//! git user expects.
+
+use std::fs;
+use std::path::Path;
+use std::process::{Command, Output};
+
+fn alt(repo: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_alt"))
+        .current_dir(repo)
+        .env("ALT_NO_DAEMON", "1")
+        .env("GIT_AUTHOR_NAME", "tester")
+        .env("GIT_AUTHOR_EMAIL", "t@e")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn ok(o: Output) -> String {
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    String::from_utf8(o.stdout).unwrap()
+}
+
+fn setup(tmp: &Path) {
+    ok(alt(tmp, &["init"]));
+    fs::write(tmp.join("readme.txt"), "first\n").unwrap();
+    ok(alt(tmp, &["add", "readme.txt"]));
+    ok(alt(tmp, &["commit", "-m", "first commit"]));
+    fs::write(tmp.join("readme.txt"), "second\n").unwrap();
+    ok(alt(tmp, &["add", "readme.txt"]));
+    ok(alt(tmp, &["commit", "-m", "second commit"]));
+}
+
+#[test]
+fn show_head_emits_header_and_unified_diff() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup(tmp.path());
+    let out = ok(alt(tmp.path(), &["show", "HEAD"]));
+    // header
+    assert!(out.starts_with("commit "), "got: {out}");
+    assert!(out.contains("author tester <t@e>"), "got: {out}");
+    assert!(out.contains("    second commit"), "got: {out}");
+    // unified diff: previous content removed, new added
+    assert!(out.contains("-first"), "got: {out}");
+    assert!(out.contains("+second"), "got: {out}");
+}
+
+#[test]
+fn show_default_argument_is_head() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup(tmp.path());
+    let with = ok(alt(tmp.path(), &["show", "HEAD"]));
+    let without = ok(alt(tmp.path(), &["show"]));
+    assert_eq!(with, without, "alt show defaults to HEAD");
+}
+
+#[test]
+fn show_emits_a_single_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup(tmp.path());
+    let out = ok(alt(tmp.path(), &["show", "HEAD"]));
+    // Only one "commit " header line — the wrapper caps -n 1.
+    assert_eq!(
+        out.lines().filter(|l| l.starts_with("commit ")).count(),
+        1,
+        "got: {out}",
+    );
+}
+
+#[test]
+fn show_resolves_tilde_ancestor() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup(tmp.path());
+    let head = ok(alt(tmp.path(), &["rev-parse", "HEAD"]));
+    let parent = ok(alt(tmp.path(), &["rev-parse", "HEAD~"]));
+    assert_ne!(head.trim(), parent.trim(), "HEAD~ != HEAD");
+    let show_parent = ok(alt(tmp.path(), &["show", "HEAD~"]));
+    assert!(
+        show_parent.contains(parent.trim()),
+        "expected parent oid in show output\nparent={parent}\nshow={show_parent}",
+    );
+    assert!(show_parent.contains("first commit"));
+}
+
+#[test]
+fn rev_parse_supports_tilde_and_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup(tmp.path());
+    let by_tilde = ok(alt(tmp.path(), &["rev-parse", "HEAD~1"]));
+    let by_caret = ok(alt(tmp.path(), &["rev-parse", "HEAD^"]));
+    assert_eq!(by_tilde.trim(), by_caret.trim(), "HEAD~1 == HEAD^");
+}
+
+#[test]
+fn rev_parse_tilde_past_root_returns_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup(tmp.path());
+    // Two commits; HEAD~3 walks past the root.
+    let out = alt(tmp.path(), &["rev-parse", "HEAD~3"]);
+    assert!(
+        !out.status.success(),
+        "expected failure when stepping past the root, got: {:?}",
+        String::from_utf8_lossy(&out.stdout),
+    );
+}
+
+#[test]
+fn rev_parse_resolves_short_oid_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup(tmp.path());
+    let head = ok(alt(tmp.path(), &["rev-parse", "HEAD"]))
+        .trim()
+        .to_string();
+    // 7-char prefix — the same length git's default short oid uses.
+    let short = &head[..7];
+    let resolved = ok(alt(tmp.path(), &["rev-parse", short]))
+        .trim()
+        .to_string();
+    assert_eq!(resolved, head);
+
+    // Show through a short prefix also works (uses the same DWIM path).
+    let out = ok(alt(tmp.path(), &["show", short]));
+    assert!(out.contains(&head), "show <short> resolves: {out}");
+}
+
+#[test]
+fn rev_parse_short_oid_below_four_chars_is_unknown() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup(tmp.path());
+    let head = ok(alt(tmp.path(), &["rev-parse", "HEAD"]))
+        .trim()
+        .to_string();
+    let too_short = &head[..3];
+    let out = alt(tmp.path(), &["rev-parse", too_short]);
+    assert!(
+        !out.status.success(),
+        "expected failure for 3-char prefix, got: {:?}",
+        String::from_utf8_lossy(&out.stdout),
+    );
+}
+
+#[test]
+fn show_rev_colon_path_prints_blob_at_that_revision() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup(tmp.path());
+    // After setup, HEAD is the second commit and readme.txt is "second\n".
+    let out = ok(alt(tmp.path(), &["show", "HEAD:readme.txt"]));
+    assert_eq!(out, "second\n", "got: {out}");
+
+    // HEAD~ has the file at its first version.
+    let parent = ok(alt(tmp.path(), &["show", "HEAD~:readme.txt"]));
+    assert_eq!(parent, "first\n", "got: {parent}");
+}
+
+#[test]
+fn show_rev_colon_path_handles_subdirs() {
+    let tmp = tempfile::tempdir().unwrap();
+    ok(alt(tmp.path(), &["init"]));
+    std::fs::create_dir_all(tmp.path().join("sub/dir")).unwrap();
+    std::fs::write(tmp.path().join("sub/dir/leaf"), "buried\n").unwrap();
+    ok(alt(tmp.path(), &["add", "sub/dir/leaf"]));
+    ok(alt(tmp.path(), &["commit", "-m", "buried"]));
+    let body = ok(alt(tmp.path(), &["show", "HEAD:sub/dir/leaf"]));
+    assert_eq!(body, "buried\n");
+}
+
+#[test]
+fn show_rev_colon_path_unknown_fails_clearly() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup(tmp.path());
+    let out = alt(tmp.path(), &["show", "HEAD:no/such/file"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not found"), "got: {err}");
+}
+
+#[test]
+fn show_rev_colon_tree_path_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    ok(alt(tmp.path(), &["init"]));
+    std::fs::create_dir_all(tmp.path().join("d")).unwrap();
+    std::fs::write(tmp.path().join("d/x"), "x\n").unwrap();
+    ok(alt(tmp.path(), &["add", "d/x"]));
+    ok(alt(tmp.path(), &["commit", "-m", "tree"]));
+    let out = alt(tmp.path(), &["show", "HEAD:d"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("is a tree"), "got: {err}");
+}
+
+#[test]
+fn show_json_returns_a_single_commit_object() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup(tmp.path());
+    let out = ok(alt(tmp.path(), &["show", "HEAD", "--json"]));
+    // Don't deserialise structurally; the field shape is shared with
+    // `alt log --json -n 1` and that's covered by its own tests. We
+    // just confirm json mode produced JSON-looking output and that the
+    // count is one.
+    assert!(out.contains("commits"), "got: {out}");
+    let opens = out.matches("\"oid\"").count();
+    assert_eq!(opens, 1, "expected one commit object, got: {out}");
+}

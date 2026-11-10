@@ -1,0 +1,19 @@
+[package]
+name = "alt-testutil"
+description = "Internal test fixtures: real-git repository builders and object walkers"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+alt-git-codec.workspace = true
+flate2.workspace = true
+
+[[bin]]
+name = "build-large-corpus"
+path = "src/bin/build_large_corpus.rs"
+
+[[bin]]
+name = "build-monorepo-corpus"
+path = "src/bin/build_monorepo_corpus.rs"

@@ -1,0 +1,29 @@
+[package]
+name = "alt-store"
+description = "alt chunk store: append-only altpack files, zstd-compressed, BLAKE3-addressed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+alt-cdc.workspace = true
+blake3.workspace = true
+memmap2.workspace = true
+thiserror.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+alt-git-codec.workspace = true
+alt-git-pack.workspace = true
+alt-testutil.workspace = true
+criterion.workspace = true
+tempfile.workspace = true
+zstd.workspace = true
+
+[[bench]]
+name = "store_hot"
+harness = false
+
+[[bench]]
+name = "read_path"
+harness = false
